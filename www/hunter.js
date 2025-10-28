@@ -1,12 +1,11 @@
-/* HUNTER-CORE r13 -- Grandeur Restore
-   - Fast bullets + longer life + impact FX
-   - Parallax textured floor + vignette gradient
-   - Solid walls/cover + player & bullet collision
-   - Smooth aim + L2 precision zoom + grounded recoil
+/* HUNTER-CORE r14 -- Bullet pace fix + long trails
+   - Bullet speed now px/second (correct integration)
+   - Much faster rounds, longer life, clearer trail
+   - Keeps smooth aim, recoil, zoom, walls & impacts
 */
 
 const CFG = {
-  // WORLD FEEL
+  // WORLD / LOOK
   tile: 48,
   floorParallax: 0.6,
   vignette: true,
@@ -20,7 +19,7 @@ const CFG = {
   rotFollowBase: 5.2,
   aimFilter: 0.22,
   aimGamma: 1.9,
-  precisionFactor: 0.35, // while holding L2/LT
+  precisionFactor: 0.35,   // while L2/LT
 
   // CAMERA
   zoomDefault: 1.00,
@@ -31,12 +30,12 @@ const CFG = {
   barrelLen: 30,
   barrelWidth: 7,
 
-  // BULLETS (AR-like by default)
-  bulletSpeed: 2600/60,     // px per frame (~2600 px/s @60fps)
-  bulletLife: 1.8,          // seconds
-  trailPoints: 8,
-  trailMinSeg2: 16,         // add trail point every 4 px
-  trailAlpha: 0.18,
+  // BULLETS -- px/second (FAST) + long life + long trail
+  bulletSpeed: 3400,        // try 3800–4200 if you want more snap
+  bulletLife: 3.0,          // seconds before fade-out
+  trailPoints: 24,          // more segments
+  trailMinSeg2: 9,          // record trail every ~3px
+  trailAlpha: 0.10,         // overall trail transparency
 
   // RECOIL (grounded)
   recoilVel: 0.22,
@@ -44,10 +43,10 @@ const CFG = {
   aimKickDecay: 0.86,
 
   // IMPACT FX
-  sparkLife: 0.18,
-  sparkCount: [6,10],
+  sparkLife: 0.22,
+  sparkCount: [8,14],
 
-  // COLLISION SUBSTEPS (avoid tunneling)
+  // COLLISION SUBSTEPS
   substeps: 3,
 
   // DUMMY
@@ -93,13 +92,8 @@ function pollPad(){
   precise=!!gp.buttons?.[6]?.pressed; // LT
 }
 
-// ---------- World: map, walls ----------
-const map = {
-  w: Math.ceil(innerWidth/CFG.tile)+8,
-  h: Math.ceil(innerHeight/CFG.tile)+8,
-  walls: [] // array of {x,y,w,h}
-};
-// layout a little arena with cover blocks
+// ---------- World ----------
+const map = { walls: [] };
 function buildArena(){
   map.walls.length=0;
   const T=CFG.tile;
@@ -118,38 +112,26 @@ buildArena();
 
 // ---------- Entities ----------
 const cam = {zoom:CFG.zoomDefault, target:CFG.zoomDefault};
-const player={
-  x: innerWidth/2, y: innerHeight/2,
-  vx:0, vy:0, rot:0, aimX:1, aimY:0, lastFire:false
-};
-const bullets = [];
-const sparks = []; // impact FX
-
+const player={ x: innerWidth/2, y: innerHeight/2, vx:0, vy:0, rot:0, aimX:1, aimY:0, lastFire:false };
+const bullets=[], sparks=[];
 const dummy = {x: innerWidth*0.68, y: innerHeight*0.42, w:44, h:34, hp: CFG.dummyHP};
 
-// ---------- Math helpers ----------
+// ---------- Helpers ----------
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
 function lerp(a,b,t){return a+(b-a)*t;}
-function sign(v){return v<0?-1:1;}
-function AABB(a,b){return a.x<a.x2 && b.x<b.x2 && a.y<a.y2 && b.y<b.y2;}
-function rectsOverlap(r1,r2){
-  return !(r2.x>r1.x+r1.w || r2.x+r2.w<r1.x || r2.y>r1.y+r1.h || r2.y+r2.h<r1.y);
-}
+function rectsOverlap(r1,r2){return !(r2.x>r1.x+r1.w || r2.x+r2.w<r1.x || r2.y>r1.y+r1.h || r2.y+r2.h<r1.y);}
 
-// ---------- Collision: player vs walls ----------
+// player vs walls sliding
 function slideAgainstWalls(x,y,r, vx,vy){
-  // capsule approximated as circle
   const me={x:x-r,y:y-r,w:r*2,h:r*2};
-  // try x
+  // x
   let nx=x+vx, ny=y;
   me.x = nx-r;
   for(const w of map.walls){
     if(rectsOverlap(me,w)){ nx = vx>0 ? w.x - r : w.x + w.w + r; vx=0; me.x=nx-r; }
   }
-  // try y
-  me.y = ny-r; me.x = nx-r;
-  ny = y+vy;
-  me.y = ny-r;
+  // y
+  ny = y+vy; me.y = ny-r; me.x = nx-r;
   for(const w of map.walls){
     if(rectsOverlap(me,w)){ ny = vy>0 ? w.y - r : w.y + w.h + r; vy=0; me.y=ny-r; }
   }
@@ -176,16 +158,17 @@ function tick(){
   const sp=Math.hypot(player.vx,player.vy);
   if(sp>CFG.maxSpeed){ const s=CFG.maxSpeed/(sp+1e-6); player.vx*=s; player.vy*=s; }
 
-  // integrate with wall sliding (substeps)
-  let vx=player.vx*dt*CFG.substeps, vy=player.vy*dt*CFG.substeps;
-  let nx=player.x, ny=player.y;
+  // integrate with wall slide (substeps)
+  let stepX=player.vx*dt/CFG.substeps, stepY=player.vy*dt/CFG.substeps;
+  let nx=player.x, ny=player.y, vx=stepX, vy=stepY;
   for(let i=0;i<CFG.substeps;i++){
     const res = slideAgainstWalls(nx,ny,14, vx,vy);
     nx=res.x; ny=res.y; vx=res.vx; vy=res.vy;
   }
-  player.x=nx; player.y=ny; player.vx=vx/(dt*CFG.substeps); player.vy=vy/(dt*CFG.substeps);
+  player.x=nx; player.y=ny;
+  player.vx=vx*CFG.substeps/dt; player.vy=vy*CFG.substeps/dt;
 
-  // aim filtering + rotation smoothing
+  // aim smoothing
   let ax=input.rx, ay=input.ry;
   const amag=Math.hypot(ax,ay);
   if(amag>0.01){
@@ -207,6 +190,7 @@ function tick(){
     const len = CFG.barrelLen*(precise?1.12:1.0);
     const bx = player.x + Math.cos(player.rot)*len;
     const by = player.y + Math.sin(player.rot)*len;
+    // vx,vy are px/second now
     const spx = Math.cos(player.rot)*CFG.bulletSpeed;
     const spy = Math.sin(player.rot)*CFG.bulletSpeed;
     bullets.push({x:bx,y:by,vx:spx,vy:spy, life:CFG.bulletLife, trail:[{x:bx,y:by}]});
@@ -215,25 +199,26 @@ function tick(){
     player.vy -= Math.sin(player.rot)*CFG.recoilVel;
   }
 
-  // bullets
+  // bullets (px/sec integration) + collision
   for(let i=bullets.length-1;i>=0;i--){
     const b=bullets[i];
-    // substep to prevent tunneling through thin walls
     let steps = CFG.substeps;
     let stepx = (b.vx*dt)/steps, stepy=(b.vy*dt)/steps;
     let hit=false, hx=b.x, hy=b.y;
+
     for(let s=0;s<steps;s++){
       const nx=b.x+stepx, ny=b.y+stepy;
-      // collide vs walls
+      // hit walls?
       for(const w of map.walls){
         if(nx>=w.x && nx<=w.x+w.w && ny>=w.y && ny<=w.y+w.h){ hit=true; hx=nx; hy=ny; break; }
       }
       b.x=nx; b.y=ny;
       if(hit) break;
     }
+
     b.life-=dt;
 
-    // trail
+    // trail accumulation
     const lp=b.trail[b.trail.length-1];
     const dx=b.x-lp.x, dy=b.y-lp.y;
     if(dx*dx+dy*dy>CFG.trailMinSeg2){
@@ -241,16 +226,15 @@ function tick(){
       if(b.trail.length>CFG.trailPoints) b.trail.shift();
     }
 
-    // dummy collision (center point)
+    // dummy hit
     if(!hit && (b.x>dummy.x-dummy.w/2 && b.x<dummy.x+dummy.w/2 && b.y>dummy.y-dummy.h/2 && b.y<dummy.y+dummy.h/2)){
       hit=true; hx=b.x; hy=b.y; dummy.hp=Math.max(0, dummy.hp-1);
     }
 
-    if(hit || b.life<=0 || b.x<-200 || b.y<-200 || b.x>innerWidth+200 || b.y>innerHeight+200){
-      // spawn sparks
-      const n = Math.floor( lerp(CFG.sparkCount[0], CFG.sparkCount[1], Math.random()) );
+    if(hit || b.life<=0 || b.x<-400 || b.y<-400 || b.x>innerWidth+400 || b.y>innerHeight+400){
+      const n = Math.floor( ((CFG.sparkCount[1]-CFG.sparkCount[0])*Math.random()) + CFG.sparkCount[0] );
       for(let k=0;k<n;k++){
-        const a=Math.random()*Math.PI*2, sp= (400+Math.random()*400)/60;
+        const a=Math.random()*Math.PI*2, sp= (500+Math.random()*500); // px/s
         sparks.push({x:hx,y:hy,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:CFG.sparkLife});
       }
       bullets.splice(i,1);
@@ -259,10 +243,10 @@ function tick(){
 
   // sparks
   for(let i=sparks.length-1;i>=0;i--){
-    const s=sparks[i];
-    s.x+=s.vx*dt; s.y+=s.vy*dt;
+    const s=sparks[i], dtlim=Math.min(dt,0.033);
+    s.x+=s.vx*dtlim; s.y+=s.vy*dtlim;
     s.vx*=0.92; s.vy*=0.92;
-    s.life-=dt;
+    s.life-=dtlim;
     if(s.life<=0) sparks.splice(i,1);
   }
 
@@ -271,7 +255,7 @@ function tick(){
 
 // ---------- Render ----------
 function render(){
-  // background gradient
+  // gradient/vignette
   if(CFG.vignette){
     const g=ctx.createLinearGradient(0,0,0,innerHeight);
     g.addColorStop(0,'#0e1118'); g.addColorStop(1,'#0b0d13');
@@ -280,7 +264,7 @@ function render(){
     ctx.fillStyle='#0d1016'; ctx.fillRect(0,0,innerWidth,innerHeight);
   }
 
-  // parallax floor checker
+  // parallax floor
   const T=CFG.tile, p=CFG.floorParallax;
   const ox = -((player.x*p)%T), oy = -((player.y*p)%T);
   for(let y=oy - T; y<innerHeight+T; y+=T){
@@ -291,7 +275,7 @@ function render(){
     }
   }
 
-  // zoom transform
+  // zoom
   ctx.save();
   ctx.translate(innerWidth/2, innerHeight/2);
   ctx.scale(cam.zoom, cam.zoom);
@@ -312,17 +296,17 @@ function render(){
     ctx.fillRect(dummy.x-30+i*10, dummy.y-dummy.h/2-12, 6, 4);
   }
 
-  // bullets (trail then head)
+  // bullet trails + heads
   for(const b of bullets){
     for(let i=1;i<b.trail.length;i++){
       const a=b.trail[i-1], d=b.trail[i];
       const t=i/b.trail.length;
-      ctx.strokeStyle=`rgba(122,168,255,${(1-t)*(1-CFG.trailAlpha)+0.12})`;
+      ctx.strokeStyle=`rgba(130,170,255,${(1-t)*(1-CFG.trailAlpha)+0.14})`;
       ctx.lineWidth = 3*(1-t)+1;
       ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(d.x,d.y); ctx.stroke();
     }
-    ctx.fillStyle='#d9e6ff';
-    ctx.beginPath(); ctx.arc(b.x,b.y,3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#e4eeff';
+    ctx.beginPath(); ctx.arc(b.x,b.y,3.2,0,Math.PI*2); ctx.fill();
   }
 
   // sparks
