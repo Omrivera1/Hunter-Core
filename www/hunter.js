@@ -1,7 +1,10 @@
-/* HUNTER-CORE r14 -- Bullet pace fix + long trails
-   - Bullet speed now px/second (correct integration)
-   - Much faster rounds, longer life, clearer trail
-   - Keeps smooth aim, recoil, zoom, walls & impacts
+/* HUNTER-CORE r15 -- Feel Rehab
+   - Faster player movement
+   - Recoil restored (shove + aim-kick decay)
+   - Enemy reacts: flash, knockback, HP pips, damage numbers
+   - Impact-only screenshake + micro hit-pause
+   - Fast bullets + long trails
+   - Smooth aim, L2 precision zoom, walls/collision retained
 */
 
 const CFG = {
@@ -10,10 +13,10 @@ const CFG = {
   floorParallax: 0.6,
   vignette: true,
 
-  // MOVEMENT
-  accel: 1.05,
-  friction: 0.90,
-  maxSpeed: 7.6,
+  // MOVEMENT (faster)
+  accel: 1.45,
+  friction: 0.88,
+  maxSpeed: 10.2,
 
   // AIM FEEL
   rotFollowBase: 5.2,
@@ -31,26 +34,25 @@ const CFG = {
   barrelWidth: 7,
 
   // BULLETS -- px/second (FAST) + long life + long trail
-  bulletSpeed: 3400,        // try 3800–4200 if you want more snap
-  bulletLife: 3.0,          // seconds before fade-out
-  trailPoints: 24,          // more segments
+  bulletSpeed: 4200,
+  bulletLife: 3.2,          // seconds
+  trailPoints: 24,
   trailMinSeg2: 9,          // record trail every ~3px
-  trailAlpha: 0.10,         // overall trail transparency
+  trailAlpha: 0.10,
 
-  // RECOIL (grounded)
-  recoilVel: 0.22,
-  recoilAimKick: 0.06,
+  // RECOIL (grounded) -- restored
+  recoilVel: 0.48,          // physical shove
+  recoilAimKick: 0.055,     // radians added then decays
   aimKickDecay: 0.86,
 
   // IMPACT FX
   sparkLife: 0.22,
   sparkCount: [8,14],
+  hitPauseMs: 65,           // micro freeze on hit
+  screenShake: 1.6,         // impact-only
 
   // COLLISION SUBSTEPS
-  substeps: 3,
-
-  // DUMMY
-  dummyHP: 8
+  substeps: 3
 };
 
 // ---------- Canvas ----------
@@ -102,24 +104,35 @@ function buildArena(){
   map.walls.push({x:innerWidth,y:-T*2,w:T*2,h:innerHeight+T*4});
   map.walls.push({x:-T*2,y:-T*2,w:innerWidth+T*4,h:T*2});
   map.walls.push({x:-T*2,y:innerHeight,w:innerWidth+T*4,h:T*2});
-  // inner cover
+  // inner cover (mid-block)
   const cx=innerWidth/2, cy=innerHeight/2;
-  map.walls.push({x:cx-180,y:cy-40,w:80,h:32});
-  map.walls.push({x:cx+160,y:cy-12,w:56,h:56});
-  map.walls.push({x:cx+300,y:cy-110,w:46,h:120});
+  map.walls.push({x:cx-180,y:cy-40,w:88,h:36});
+  map.walls.push({x:cx+160,y:cy-12,w:60,h:60});
+  map.walls.push({x:cx+300,y:cy-110,w:50,h:124});
 }
 buildArena();
 
 // ---------- Entities ----------
 const cam = {zoom:CFG.zoomDefault, target:CFG.zoomDefault};
-const player={ x: innerWidth/2, y: innerHeight/2, vx:0, vy:0, rot:0, aimX:1, aimY:0, lastFire:false };
-const bullets=[], sparks=[];
-const dummy = {x: innerWidth*0.68, y: innerHeight*0.42, w:44, h:34, hp: CFG.dummyHP};
+const world = { timeFreezeUntil:0, shakeUntil:0, shakeMag:0 };
+
+const player={
+  x: innerWidth/2, y: innerHeight/2,
+  vx:0, vy:0, rot:0, aimX:1, aimY:0, lastFire:false,
+  aimKick:0
+};
+
+const bullets=[], sparks=[], dmgNums=[];
+const enemy = {
+  x: innerWidth*0.68, y: innerHeight*0.42, w:44, h:34,
+  hpMax: 10, hp: 10, hurtUntil: 0, flashUntil: 0
+};
 
 // ---------- Helpers ----------
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
 function lerp(a,b,t){return a+(b-a)*t;}
 function rectsOverlap(r1,r2){return !(r2.x>r1.x+r1.w || r2.x+r2.w<r1.x || r2.y>r1.y+r1.h || r2.y+r2.h<r1.y);}
+function nowMs(){return performance.now();}
 
 // player vs walls sliding
 function slideAgainstWalls(x,y,r, vx,vy){
@@ -138,13 +151,32 @@ function slideAgainstWalls(x,y,r, vx,vy){
   return {x:nx,y:ny,vx,vy};
 }
 
+function enemyAABB(){
+  return {x: enemy.x - enemy.w/2, y: enemy.y - enemy.h/2, w: enemy.w, h: enemy.h};
+}
+
+function spawnSparks(x,y){
+  const n = Math.floor( ((CFG.sparkCount[1]-CFG.sparkCount[0])*Math.random()) + CFG.sparkCount[0] );
+  for(let k=0;k<n;k++){
+    const a=Math.random()*Math.PI*2, sp= (500+Math.random()*500); // px/s
+    sparks.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:CFG.sparkLife});
+  }
+}
+
+function addDmg(x,y,txt){
+  dmgNums.push({x,y,txt,vy:-24, alpha:1, birth:nowMs()});
+}
+
 // ---------- Update ----------
 let last=performance.now();
 function tick(){
   requestAnimationFrame(tick);
-  const now=performance.now();
-  let dt=(now-last)/1000; last=now;
+  const t=performance.now();
+  let dt=(t-last)/1000; last=t;
   dt=Math.min(dt,1/30);
+
+  const frozen = t < world.timeFreezeUntil;
+  const activeDt = frozen ? 0 : dt;
 
   pollPad();
 
@@ -159,26 +191,28 @@ function tick(){
   if(sp>CFG.maxSpeed){ const s=CFG.maxSpeed/(sp+1e-6); player.vx*=s; player.vy*=s; }
 
   // integrate with wall slide (substeps)
-  let stepX=player.vx*dt/CFG.substeps, stepY=player.vy*dt/CFG.substeps;
+  let stepX=player.vx*activeDt/CFG.substeps, stepY=player.vy*activeDt/CFG.substeps;
   let nx=player.x, ny=player.y, vx=stepX, vy=stepY;
   for(let i=0;i<CFG.substeps;i++){
     const res = slideAgainstWalls(nx,ny,14, vx,vy);
     nx=res.x; ny=res.y; vx=res.vx; vy=res.vy;
   }
   player.x=nx; player.y=ny;
-  player.vx=vx*CFG.substeps/dt; player.vy=vy*CFG.substeps/dt;
+  player.vx=vx*CFG.substeps/(activeDt||1); player.vy=vy*CFG.substeps/(activeDt||1);
 
-  // aim smoothing
+  // aim smoothing + aim kick
   let ax=input.rx, ay=input.ry;
   const amag=Math.hypot(ax,ay);
   if(amag>0.01){
     const f=CFG.aimFilter*(precise?CFG.precisionFactor:1);
     player.aimX = lerp(player.aimX, ax/amag, f);
     player.aimY = lerp(player.aimY, ay/amag, f);
-    const targ = Math.atan2(player.aimY,player.aimX);
+    const targ = Math.atan2(player.aimY,player.aimX) + player.aimKick;
     let d=((targ-player.rot+Math.PI*3)%(Math.PI*2))-Math.PI;
-    player.rot += d * (CFG.rotFollowBase*(precise?CFG.precisionFactor:1)) * dt;
+    player.rot += d * (CFG.rotFollowBase*(precise?CFG.precisionFactor:1)) * activeDt;
   }
+  // decay aim kick
+  if (Math.abs(player.aimKick) > 1e-4) player.aimKick *= CFG.aimKickDecay;
 
   cam.target = precise?CFG.zoomPrecision:CFG.zoomDefault;
   cam.zoom = lerp(cam.zoom, cam.target, CFG.zoomLerp);
@@ -186,25 +220,27 @@ function tick(){
   // fire (semi; edge detect)
   const pressed = input.fire && !player.lastFire;
   player.lastFire = input.fire;
-  if(pressed){
+  if(pressed && !frozen){
     const len = CFG.barrelLen*(precise?1.12:1.0);
     const bx = player.x + Math.cos(player.rot)*len;
     const by = player.y + Math.sin(player.rot)*len;
-    // vx,vy are px/second now
+    // px/sec velocity
     const spx = Math.cos(player.rot)*CFG.bulletSpeed;
     const spy = Math.sin(player.rot)*CFG.bulletSpeed;
     bullets.push({x:bx,y:by,vx:spx,vy:spy, life:CFG.bulletLife, trail:[{x:bx,y:by}]});
-    // grounded recoil
+    // recoil (physical + aim kick)
     player.vx -= Math.cos(player.rot)*CFG.recoilVel;
     player.vy -= Math.sin(player.rot)*CFG.recoilVel;
+    player.aimKick += (Math.random()*2-1)*0.01 + CFG.recoilAimKick;
   }
 
   // bullets (px/sec integration) + collision
+  const eBox = enemyAABB();
   for(let i=bullets.length-1;i>=0;i--){
     const b=bullets[i];
     let steps = CFG.substeps;
-    let stepx = (b.vx*dt)/steps, stepy=(b.vy*dt)/steps;
-    let hit=false, hx=b.x, hy=b.y;
+    let stepx = (b.vx*activeDt)/steps, stepy=(b.vy*activeDt)/steps;
+    let hit=false, hx=b.x, hy=b.y, hitEnemy=false;
 
     for(let s=0;s<steps;s++){
       const nx=b.x+stepx, ny=b.y+stepy;
@@ -212,49 +248,86 @@ function tick(){
       for(const w of map.walls){
         if(nx>=w.x && nx<=w.x+w.w && ny>=w.y && ny<=w.y+w.h){ hit=true; hx=nx; hy=ny; break; }
       }
+      if(hit){ b.x=nx; b.y=ny; break; }
+
+      // hit enemy?
+      if(nx>=eBox.x && nx<=eBox.x+eBox.w && ny>=eBox.y && ny<=eBox.y+eBox.h){
+        hit=true; hitEnemy=true; hx=nx; hy=ny; b.x=nx; b.y=ny; break;
+      }
+
       b.x=nx; b.y=ny;
-      if(hit) break;
     }
 
-    b.life-=dt;
-
-    // trail accumulation
-    const lp=b.trail[b.trail.length-1];
-    const dx=b.x-lp.x, dy=b.y-lp.y;
-    if(dx*dx+dy*dy>CFG.trailMinSeg2){
-      b.trail.push({x:b.x,y:b.y});
-      if(b.trail.length>CFG.trailPoints) b.trail.shift();
-    }
-
-    // dummy hit
-    if(!hit && (b.x>dummy.x-dummy.w/2 && b.x<dummy.x+dummy.w/2 && b.y>dummy.y-dummy.h/2 && b.y<dummy.y+dummy.h/2)){
-      hit=true; hx=b.x; hy=b.y; dummy.hp=Math.max(0, dummy.hp-1);
+    if(!frozen){
+      b.life-=dt;
+      // trail accumulation
+      const lp=b.trail[b.trail.length-1];
+      const dx=b.x-lp.x, dy=b.y-lp.y;
+      if(dx*dx+dy*dy>CFG.trailMinSeg2){
+        b.trail.push({x:b.x,y:b.y});
+        if(b.trail.length>CFG.trailPoints) b.trail.shift();
+      }
     }
 
     if(hit || b.life<=0 || b.x<-400 || b.y<-400 || b.x>innerWidth+400 || b.y>innerHeight+400){
-      const n = Math.floor( ((CFG.sparkCount[1]-CFG.sparkCount[0])*Math.random()) + CFG.sparkCount[0] );
-      for(let k=0;k<n;k++){
-        const a=Math.random()*Math.PI*2, sp= (500+Math.random()*500); // px/s
-        sparks.push({x:hx,y:hy,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:CFG.sparkLife});
+      spawnSparks(hx,hy);
+
+      if(hitEnemy){
+        // enemy reactions
+        enemy.hp = Math.max(0, enemy.hp - 1);
+        enemy.flashUntil = t + 120;
+        enemy.hurtUntil = t + 180;
+        // enemy knockback (small)
+        const kb = 1800; // px/sec
+        const dirx = Math.cos(player.rot), diry = Math.sin(player.rot);
+        enemy.x += dirx * (kb * dt * 0.25);
+        enemy.y += diry * (kb * dt * 0.25);
+        // hit-pause & screenshake
+        world.timeFreezeUntil = t + CFG.hitPauseMs;
+        world.shakeMag = CFG.screenShake; world.shakeUntil = t + 150;
+        // damage number
+        addDmg(hx, hy, '34');
+        // clamp enemy inside arena (rough)
+        const cl = {x:0,y:0,w:innerWidth,h:innerHeight};
+        enemy.x = clamp(enemy.x, cl.x + enemy.w/2, cl.x+cl.w - enemy.w/2);
+        enemy.y = clamp(enemy.y, cl.y + enemy.h/2, cl.y+cl.h - enemy.h/2);
+
+        // respawn if dead
+        if(enemy.hp <= 0){
+          setTimeout(()=>{
+            enemy.hp = enemy.hpMax;
+            enemy.x = innerWidth*0.68; enemy.y = innerHeight*0.42;
+          }, 450);
+        }
       }
+
       bullets.splice(i,1);
     }
   }
 
   // sparks
   for(let i=sparks.length-1;i>=0;i--){
-    const s=sparks[i], dtlim=Math.min(dt,0.033);
+    const s=sparks[i], dtlim=Math.min(activeDt,0.033);
     s.x+=s.vx*dtlim; s.y+=s.vy*dtlim;
     s.vx*=0.92; s.vy*=0.92;
     s.life-=dtlim;
     if(s.life<=0) sparks.splice(i,1);
   }
 
-  render();
+  // damage numbers
+  for(let i=dmgNums.length-1;i>=0;i--){
+    const d=dmgNums[i];
+    const age = (t - d.birth);
+    d.y += (d.vy * (activeDt||0)); d.vy *= 0.98;
+    d.alpha = Math.max(0, 1 - age/550);
+    if(age>550) dmgNums.splice(i,1);
+  }
+
+  render(t);
 }
 
 // ---------- Render ----------
-function render(){
+function render(t){
   // gradient/vignette
   if(CFG.vignette){
     const g=ctx.createLinearGradient(0,0,0,innerHeight);
@@ -264,7 +337,7 @@ function render(){
     ctx.fillStyle='#0d1016'; ctx.fillRect(0,0,innerWidth,innerHeight);
   }
 
-  // parallax floor
+  // parallax floor (moves with player to suggest space)
   const T=CFG.tile, p=CFG.floorParallax;
   const ox = -((player.x*p)%T), oy = -((player.y*p)%T);
   for(let y=oy - T; y<innerHeight+T; y+=T){
@@ -275,9 +348,14 @@ function render(){
     }
   }
 
-  // zoom
+  // camera shake (impact only)
+  const shaking = t < world.shakeUntil;
+  const sx = shaking ? (Math.random()*2-1)*world.shakeMag : 0;
+  const sy = shaking ? (Math.random()*2-1)*world.shakeMag : 0;
+
+  // zoom + shake
   ctx.save();
-  ctx.translate(innerWidth/2, innerHeight/2);
+  ctx.translate(innerWidth/2 + sx, innerHeight/2 + sy);
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-innerWidth/2, -innerHeight/2);
 
@@ -288,21 +366,27 @@ function render(){
   ctx.lineWidth=1;
   for(const w of map.walls){ ctx.strokeRect(w.x+0.5,w.y+0.5,w.w-1,w.h-1); }
 
-  // dummy
-  ctx.strokeStyle='#cfe0ff'; ctx.lineWidth=2;
-  ctx.strokeRect(dummy.x-dummy.w/2, dummy.y-dummy.h/2, dummy.w, dummy.h);
-  for(let i=0;i<dummy.hp;i++){
+  // enemy (flash when hit)
+  const flashing = t < enemy.flashUntil;
+  ctx.save();
+  ctx.globalAlpha = flashing ? 1.0 : 1.0;
+  ctx.strokeStyle = flashing ? '#ffffff' : '#cfe0ff';
+  ctx.lineWidth = flashing ? 3 : 2;
+  ctx.strokeRect(enemy.x-enemy.w/2, enemy.y-enemy.h/2, enemy.w, enemy.h);
+  // HP pips
+  for(let i=0;i<enemy.hp;i++){
     ctx.fillStyle='#ff6b6b';
-    ctx.fillRect(dummy.x-30+i*10, dummy.y-dummy.h/2-12, 6, 4);
+    ctx.fillRect(enemy.x-30+i*10, enemy.y-enemy.h/2-12, 6, 4);
   }
+  ctx.restore();
 
-  // bullet trails + heads
+  // bullets (trail then head)
   for(const b of bullets){
     for(let i=1;i<b.trail.length;i++){
       const a=b.trail[i-1], d=b.trail[i];
-      const t=i/b.trail.length;
-      ctx.strokeStyle=`rgba(130,170,255,${(1-t)*(1-CFG.trailAlpha)+0.14})`;
-      ctx.lineWidth = 3*(1-t)+1;
+      const tseg=i/b.trail.length;
+      ctx.strokeStyle=`rgba(130,170,255,${(1-tseg)*(1-CFG.trailAlpha)+0.14})`;
+      ctx.lineWidth = 3*(1-tseg)+1;
       ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(d.x,d.y); ctx.stroke();
     }
     ctx.fillStyle='#e4eeff';
@@ -330,6 +414,16 @@ function render(){
   ctx.beginPath(); ctx.moveTo(player.x,player.y); ctx.lineTo(bx,by); ctx.stroke();
   ctx.fillStyle='rgba(255,255,255,0.8)';
   ctx.beginPath(); ctx.arc(bx,by,2.6,0,Math.PI*2); ctx.fill();
+
+  // damage numbers
+  for(const d of dmgNums){
+    ctx.globalAlpha = d.alpha*0.95;
+    ctx.fillStyle = '#e8ecf2';
+    ctx.font = '600 12px -apple-system, system-ui, sans-serif';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(d.txt, d.x, d.y);
+    ctx.globalAlpha = 1;
+  }
 
   ctx.restore();
 
