@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HUNTER — Core Graybox</title>
+  <link rel="stylesheet" href="style.css" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+</head>
+<body>
+  <div id="gate">
+    <button id="startBtn">Tap to Start</button>
+    <p>Backbone ready — after tap, press any controller button to wake inputs.</p>
+  </div>
+  <canvas id="c" width="900" height="506"></canvas>
+  <div id="hud"><span id="status">Warming up…</span></div>
+
+  <script type="module">
+    import { Audio, bootAudioAndPreload } from './audio.js';
+    import { startGame } from './game.js';
+
+    const manifest = {
+      music_menu: 'assets/music/menu_loop.m4a',
+      music_fight:'assets/music/fight_loop.m4a',
+      click:      'assets/sfx/ui_click.m4a',
+      dash:       'assets/sfx/dash_whoosh.m4a',
+      hit:        'assets/sfx/hit_thump.m4a'
+    };
+
+    const gate = document.getElementById('gate');
+    const btn  = document.getElementById('startBtn');
+
+    btn.addEventListener('click', async () => {
+      gate.style.display = 'none';
+      await bootAudioAndPreload(manifest).catch(()=>{});
+      Audio.playMusic('music_menu', { volume: 0.6, loop: true, loopStart: 0.5, loopEnd: 26.5, fade: 0.6 });
+      startGame();
+    });
+  </script>
+</body>
+</html>

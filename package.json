@@ -1,0 +1,8 @@
+{
+  "name": "hunter-core",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": { "build": "mkdir -p dist && cp -R www/* dist" },
+  "devDependencies": { "@capacitor/cli": "^6.0.0" },
+  "dependencies": { "@capacitor/core": "^6.0.0", "@capacitor/ios": "^6.0.0" }
+}
