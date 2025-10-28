@@ -2,17 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
-  <title>HUNTER – Core</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Hunter – Core</title>
   <style>
-    html, body { margin:0; padding:0; height:100%; background:#0b0d10; color:#cfd3d8; font-family: -apple-system, system-ui, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-    #hud { position:fixed; left:10px; bottom:10px; font-size:14px; opacity:.85; }
-    canvas { display:block; width:100vw; height:100vh; touch-action:none; }
+    html,body {margin:0;height:100%;background:#0f1620;overscroll-behavior:none;}
+    #c {display:block;width:100vw;height:100vh;touch-action:none;}
+    .hud{position:fixed;left:12px;top:12px;font:14px/1.2 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;color:#cbd5e1;
+      background:#0b1220aa;border:1px solid #223047;border-radius:6px;padding:10px 12px;backdrop-filter: blur(3px);}
+    .hud.bottom{left:12px;bottom:12px;top:auto}
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
-  <div id="hud">Controller OK</div>
-  <script src="hunter.js"></script>
+  <div id="hud" class="hud">Controller ?<br>Mode: AUTO</div>
+  <div id="hud2" class="hud bottom">Controller OK</div>
+  <script defer src="hunter.js"></script>
 </body>
 </html>
