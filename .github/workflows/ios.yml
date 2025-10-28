@@ -1,0 +1,29 @@
+name: Build iOS IPA
+on: [workflow_dispatch]
+jobs:
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm i
+      - run: npm run build
+      - run: npx cap init "HUNTER" "com.moises.hunter" --web-dir=dist || true
+      - run: npx cap add ios || true
+      - run: npx cap sync ios
+      - name: Build archive
+        run: |
+          xcodebuild -workspace ios/App/App.xcworkspace \
+            -scheme App -configuration Release \
+            -archivePath $PWD/build/App.xcarchive archive
+      - name: Export unsigned IPA
+        run: |
+          mkdir -p build/ipa
+          APP_PATH=$(find $PWD/build/App.xcarchive/Products/Applications -name "*.app" | head -n1)
+          mkdir -p Payload && cp -R "$APP_PATH" Payload/
+          /usr/bin/zip -r build/ipa/HUNTER-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: build/ipa/*.ipa
