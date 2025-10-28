@@ -1,28 +1,55 @@
 name: Build iOS IPA
 on: [workflow_dispatch]
+
 jobs:
   ios:
     runs-on: macos-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npm i
-      - run: npm run build
-      - run: npx cap init "HUNTER" "com.moises.hunter" --web-dir=dist || true
-      - run: npx cap add ios || true
-      - run: npx cap sync ios
-      - name: Build archive
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install deps
         run: |
+          npm ci || npm i
+
+      - name: Add TypeScript for Capacitor
+        run: npm i -D typescript
+
+      - name: Prepare Capacitor iOS project
+        run: |
+          set -e
+          npm run build || true        # makes ./dist from /www via our script
+          npx cap init "HUNTER" "com.moises.hunter" --web-dir=dist || true
+          npx cap add ios || true
+          npx cap sync ios
+
+      - name: Ensure CocoaPods & install pods
+        run: |
+          set -e
+          pod --version
+          cd ios/App
+          pod install --repo-update
+
+      - name: Build Xcode archive
+        run: |
+          set -e
           xcodebuild -workspace ios/App/App.xcworkspace \
             -scheme App -configuration Release \
             -archivePath $PWD/build/App.xcarchive archive
+
       - name: Export unsigned IPA
         run: |
+          set -e
           mkdir -p build/ipa
           APP_PATH=$(find $PWD/build/App.xcarchive/Products/Applications -name "*.app" | head -n1)
           mkdir -p Payload && cp -R "$APP_PATH" Payload/
           /usr/bin/zip -r build/ipa/HUNTER-unsigned.ipa Payload
+
       - uses: actions/upload-artifact@v4
         with:
           name: ios-ipa
