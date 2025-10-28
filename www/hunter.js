@@ -1,8 +1,9 @@
-/* HUNTER-CORE r6 — M1 Gunplay Polish
-   Identity: Military Real + Wick Precision
-   Adds: recoil impulse, muzzle flash (procedural), micro hit-pause, damage numbers,
-         sharper impact FX, edge-trigger fire (no auto), light screenshake.
-   Keeps: LEFT=move, RIGHT=aim, invert OFF.
+/* HUNTER-CORE r7 -- Gunfeel blend + smooth aim
+   - LEFT=move, RIGHT=aim (invert OFF), no auto-fire unless weapon mode=auto/burst
+   - Smooth barrel rotation (shortest-angle lerp) + light aim filtering
+   - Impact-only screenshake
+   - Single bullet with subtle hybrid trail (tracer + gas-tear + snap), no multi-smear
+   - Weapon system scaffold: semi/auto/burst (pistol stays semi)
 */
 
 const canvas = document.getElementById('c');
@@ -16,17 +17,21 @@ const CFG = {
   friction: 0.88,
   accel: 0.85,
   maxSpeed: 7.2,
-  bulletSpeed: 19,
-  bulletCooldownMs: 110,     // base semiauto cadence
   grid: 48,
 
-  // Gunfeel polish
-  recoilImpulse: 2.1,        // push back per shot (units/frame)
-  hitPauseMs: 70,            // micro freeze on hit
-  shakeOnShot: 0.8,          // light camera shake magnitude
-  shakeOnHit: 1.6,           // a bit stronger on confirmed hit
-  dmgFloatUp: 26,            // how far damage text rises
-  dmgLife: 500,              // ms
+  // bullets / gunfeel
+  bulletSpeed: 19,
+  impactShake: 1.6,   // shake ONLY on impact
+  hitPauseMs: 70,     // micro freeze on hit
+  recoilImpulse: 2.1, // physical push on fire
+
+  // smoothing
+  rotFollow: 12.0,    // how fast barrel rotates toward aim (bigger = snappier, but still smooth)
+  aimFilter: 0.35,    // low-pass on stick aim when active (0..1)
+
+  // trail
+  trailPoints: 6,     // how many samples to render behind bullet
+  trailFade: 0.22,    // alpha falloff per segment
 };
 /* ================== */
 
@@ -35,8 +40,10 @@ const world = { bullets:[], fx:[], dmg:[], shakeT:0, shakeMag:0, timeFreezeUntil
 const player = {
   x: innerWidth/2, y: innerHeight/2,
   vx:0, vy:0, r:14,
-  rot:0, lastShot:0,
-  aim:{x:1, y:0},
+  rot:0,           // current rendered rotation
+  targetRot:0,     // where we want to face
+  lastShot:0,
+  aim:{x:1, y:0},  // smoothed aim vector
 };
 
 const input = { lx:0, ly:0, rx:0, ry:0, fire:false, prevFire:false };
@@ -77,10 +84,23 @@ function pollGamepad(){
   input.fire = !!gp.buttons?.[7]?.pressed || !!keys['Space']; // R2/Space only
 }
 
-/* ----- Dummy target (for feedback) ----- */
+/* ----- Targets (dummy) ----- */
 let dummy = spawnDummy();
 function spawnDummy(){ return { x:innerWidth*0.65, y:innerHeight*0.5, w:26, h:32, alive:true, hp:6 }; }
 function pointInRect(px,py,r){ return px>=r.x-r.w/2 && px<=r.x+r.w/2 && py>=r.y-r.h/2 && py<=r.y+r.h/2; }
+
+/* ----- Weapons scaffold ----- */
+const weapons = {
+  pistol: { mode:'semi', rpm:520, burstCount:0, burstGapMs:0, recoil:CFG.recoilImpulse },
+  smg:    { mode:'auto', rpm:800, burstCount:0, burstGapMs:0, recoil:1.3 },
+  ar:     { mode:'auto', rpm:690, burstCount:0, burstGapMs:0, recoil:1.8 },
+  burst:  { mode:'burst', rpm:900, burstCount:3, burstGapMs:55, recoil:1.5 }
+};
+let weapon = weapons.pistol; // current loadout (we'll expose a switcher later)
+
+function fireIntervalMs(w){ return Math.max(30, Math.floor(60000 / w.rpm)); }
+
+let burstQueue = 0, nextBurstAt = 0;
 
 /* ----- Loop ----- */
 let last = performance.now();
@@ -97,98 +117,145 @@ function step(now){
   pollGamepad();
 
   // MOVE (left stick) + keyboard fallback
-  const kmx = (keys['KeyA']||keys['ArrowLeft']?-1:0) + (keys['KeyD']||keys['ArrowRight']?1:0);
-  const kmy = (keys['KeyW']||keys['ArrowUp']?-1:0) + (keys['KeyS']||keys['ArrowDown']?1:0);
+  const kmx=(keys['KeyA']||keys['ArrowLeft']?-1:0)+(keys['KeyD']||keys['ArrowRight']?1:0);
+  const kmy=(keys['KeyW']||keys['ArrowUp']?-1:0)+(keys['KeyS']||keys['ArrowDown']?1:0);
   const moveX = kmx || input.lx, moveY = kmy || input.ly;
 
   player.vx += moveX * CFG.accel * (frozen?0:1);
   player.vy += moveY * CFG.accel * (frozen?0:1);
   player.vx *= CFG.friction; player.vy *= CFG.friction;
   const sp=Math.hypot(player.vx,player.vy); if(sp>CFG.maxSpeed){ const k=CFG.maxSpeed/sp; player.vx*=k; player.vy*=k; }
-  player.x += player.vx * (frozen?0:1); player.y += player.vy * (frozen?0:1);
+  player.x += player.vx * (frozen?0:1);
+  player.y += player.vy * (frozen?0:1);
 
-  // AIM (right stick) — independent; keeps last when idle
-  if(Math.abs(input.rx)+Math.abs(input.ry) > 0.001){
-    player.aim.x = input.rx; player.aim.y = input.ry;
-    player.rot = Math.atan2(player.aim.y, player.aim.x);
+  // AIM smoothing (right stick only; keep last if idle)
+  const aimMag = Math.hypot(input.rx, input.ry);
+  if(aimMag > 0.001){
+    // low-pass filter the stick to remove chatter
+    const nx = input.rx/aimMag, ny = input.ry/aimMag;
+    player.aim.x = lerp(player.aim.x, nx, CFG.aimFilter);
+    player.aim.y = lerp(player.aim.y, ny, CFG.aimFilter);
   }
+  // compute target rot from filtered aim; if no aim input, keep prior
+  if(aimMag > 0.05){
+    player.targetRot = Math.atan2(player.aim.y, player.aim.x);
+  }
+  // smooth rotation toward target (shortest angle)
+  player.rot = angleLerp(player.rot, player.targetRot, clamp01(dt * CFG.rotFollow));
 
-  // FIRE edge detection (no auto)
+  // FIRE control
+  const interval = fireIntervalMs(weapon);
   const justPressed = input.fire && !input.prevFire;
-  if(justPressed && (now - player.lastShot) > CFG.bulletCooldownMs){
-    player.lastShot = now;
-    shoot();
+  if(!frozen){
+    if(weapon.mode === 'semi'){
+      if(justPressed && now - player.lastShot > interval) doShoot(now, weapon.recoil);
+    } else if(weapon.mode === 'auto'){
+      if(input.fire && now - player.lastShot > interval) doShoot(now, weapon.recoil);
+    } else if(weapon.mode === 'burst'){
+      if(justPressed && burstQueue===0){ burstQueue = weapon.burstCount; nextBurstAt = now; }
+      if(burstQueue>0 && now >= nextBurstAt){
+        doShoot(now, weapon.recoil);
+        burstQueue--;
+        nextBurstAt = now + weapon.burstGapMs;
+      }
+    }
   }
   input.prevFire = input.fire;
 
-  // Update bullets + hits
+  // bullets
   for(let i=world.bullets.length-1;i>=0;i--){
     const b=world.bullets[i];
-    b.x += b.vx * (frozen?0:1);
-    b.y += b.vy * (frozen?0:1);
-    if((now - b.birth) > 1500){ world.bullets.splice(i,1); continue; }
-
+    if(!frozen){
+      // trail sample
+      b.trail.unshift({x:b.x, y:b.y});
+      if(b.trail.length > CFG.trailPoints) b.trail.pop();
+      // advance
+      b.x += b.vx; b.y += b.vy;
+    }
+    // lifetime / bounds
+    if((now - b.birth) > 1500 || b.x<-80 || b.y<-80 || b.x>innerWidth+80 || b.y>innerHeight+80){
+      world.bullets.splice(i,1); continue;
+    }
+    // impact
     if(dummy.alive && pointInRect(b.x,b.y,dummy)){
       world.bullets.splice(i,1);
       dummy.hp--;
-      // FX
-      world.fx.push({ type:'impact', x:b.x, y:b.y, birth:now });
-      addDamageText(b.x, b.y, 34);  // temp fixed damage
-      // Hit-pause + shake
-      world.timeFreezeUntil = now + CFG.hitPauseMs;
-      world.shakeMag = CFG.shakeOnHit; world.shakeT = now + 120;
+      impactFX(b.x,b.y, now);
       if(dummy.hp<=0){ dummy.alive=false; setTimeout(()=>{ dummy=spawnDummy(); }, 600); }
     }
   }
 
-  // Expire FX & dmg text
+  // FX & damage text
   for(let i=world.fx.length-1;i>=0;i--){
-    const f=world.fx[i]; if(now - f.birth > 240) world.fx.splice(i,1);
+    const f=world.fx[i]; if(now - f.birth > f.lifeMs) world.fx.splice(i,1);
   }
   for(let i=world.dmg.length-1;i>=0;i--){
-    const d=world.dmg[i]; const t = (now - d.birth);
-    d.y = d.baseY - (CFG.dmgFloatUp * (t/CFG.dmgLife));
-    d.alpha = Math.max(0, 1 - t/CFG.dmgLife);
-    if(t > CFG.dmgLife) world.dmg.splice(i,1);
+    const d=world.dmg[i];
+    const t = now - d.birth;
+    d.y = d.baseY - (26 * (t/500));
+    d.alpha = Math.max(0, 1 - t/500);
+    if(t>500) world.dmg.splice(i,1);
   }
 
   draw(now);
 }
 
-/* ----- Actions ----- */
-function shoot(){
-  // muzzle pos
+/* ----- Shoot / Impact ----- */
+function doShoot(now, recoil){
+  player.lastShot = now;
+
   const bx = player.x + Math.cos(player.rot)*(player.r+10);
   const by = player.y + Math.sin(player.rot)*(player.r+10);
-  // bullet
+
   world.bullets.push({
     x:bx, y:by,
     vx:Math.cos(player.rot)*CFG.bulletSpeed,
     vy:Math.sin(player.rot)*CFG.bulletSpeed,
-    birth: performance.now()
+    birth: now,
+    trail: []   // recent positions for hybrid trail
   });
-  // recoil
-  player.vx -= Math.cos(player.rot)*CFG.recoilImpulse;
-  player.vy -= Math.sin(player.rot)*CFG.recoilImpulse;
-  // muzzle flash + shot shake
-  world.fx.push({ type:'muzzle', x:bx, y:by, rot:player.rot, birth:performance.now() });
-  world.shakeMag = Math.max(world.shakeMag, CFG.shakeOnShot); world.shakeT = performance.now() + 90;
+
+  // recoil (physical, tiny)
+  player.vx -= Math.cos(player.rot)*recoil;
+  player.vy -= Math.sin(player.rot)*recoil;
+
+  // muzzle visual (very fast, gas-pressure style)
+  world.fx.push({ type:'muzzle', x:bx, y:by, rot:player.rot, birth:now, lifeMs:120 });
 }
 
-function addDamageText(x,y,amount){
-  world.dmg.push({ x, y, baseY:y, txt:String(amount), birth:performance.now(), alpha:1 });
+function impactFX(x,y, now){
+  // ONLY on impact: micro hit-pause + stronger shake
+  world.timeFreezeUntil = now + CFG.hitPauseMs;
+  world.shakeMag = 1.0 * CFG.impactShake; world.shakeT = now + 130;
+
+  // ring burst
+  world.fx.push({ type:'impact', x, y, birth:now, lifeMs:240 });
+
+  // tiny damage number (surgical)
+  world.dmg.push({ x, y, baseY:y, txt:'34', birth:now, alpha:1 });
+}
+
+/* ----- Helpers ----- */
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp01(v){ return v<0?0:v>1?1:v; }
+function angleLerp(a, b, t){
+  let d = (b - a) % (Math.PI*2);
+  if (d > Math.PI) d -= Math.PI*2;
+  if (d < -Math.PI) d += Math.PI*2;
+  return a + d * t;
 }
 
 /* ----- Render ----- */
 function draw(now){
-  // camera shake (micro, decays fast)
+  // camera shake (impact only)
   const shaking = now < world.shakeT;
   const sx = shaking ? (Math.random()*2-1)*world.shakeMag : 0;
   const sy = shaking ? (Math.random()*2-1)*world.shakeMag : 0;
 
-  // bg
   ctx.save();
   ctx.translate(sx, sy);
+
+  // bg
   ctx.fillStyle='#0b0d10';
   ctx.fillRect(0,0,canvas.width/devicePixelRatio,canvas.height/devicePixelRatio);
 
@@ -198,48 +265,51 @@ function draw(now){
   for(let y=0;y<innerHeight;y+=g){ ctx.moveTo(0,y+.5); ctx.lineTo(innerWidth,y+.5); }
   ctx.stroke(); ctx.globalAlpha=1;
 
-  // bullets
-  ctx.fillStyle='#9ad1ff';
-  for(const b of world.bullets){ ctx.beginPath(); ctx.arc(b.x,b.y,3,0,Math.PI*2); ctx.fill(); }
+  // bullets + hybrid trail
+  for(const b of world.bullets){
+    // trail: draw from newest to oldest, fading
+    for(let i=0;i<b.trail.length;i++){
+      const p = b.trail[i], a = Math.max(0, 1 - i*CFG.trailFade);
+      ctx.globalAlpha = 0.18 * a;                // faint pressure shimmer
+      ctx.strokeStyle = '#b9c7d6';
+      ctx.lineWidth = 2 - i*0.25;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(i? b.trail[i-1].x : b.x, i? b.trail[i-1].y : b.y); ctx.stroke();
+
+      ctx.globalAlpha = 0.10 * a;                // subtle tracer glow
+      ctx.strokeStyle = '#dfe9ff';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(i? b.trail[i-1].x : b.x, i? b.trail[i-1].y : b.y); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    // core pellet
+    ctx.fillStyle='#e9f1ff';
+    ctx.beginPath(); ctx.arc(b.x,b.y,2.3,0,Math.PI*2); ctx.fill();
+  }
 
   // FX
   for(const f of world.fx){
-    const age = (now - f.birth);
+    const age = now - f.birth;
     if(f.type==='impact'){
       const a = Math.max(0, 1 - age/240);
-      ctx.globalAlpha = a;
-      ctx.strokeStyle = '#9ad1ff'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(f.x,f.y, 6+age*0.04, 0, Math.PI*2); ctx.stroke();
-      ctx.globalAlpha = 1;
+      ctx.globalAlpha = a; ctx.strokeStyle = '#9ad1ff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(f.x,f.y, 6+age*0.04, 0, Math.PI*2); ctx.stroke(); ctx.globalAlpha=1;
     }
     if(f.type==='muzzle'){
-      const life = Math.max(0, 1 - age/120);
-      if(life<=0) continue;
-      ctx.save();
-      ctx.translate(f.x, f.y);
-      ctx.rotate(f.rot);
-      ctx.globalAlpha = 0.35 * life;
-      // pressure cone (thin, fast)
-      ctx.fillStyle = '#f7f3d4';
-      ctx.beginPath();
-      ctx.moveTo(0,0);
-      ctx.lineTo(18+age*0.05, 4);
-      ctx.lineTo(18+age*0.05,-4);
-      ctx.closePath();
-      ctx.fill();
-      // flash core
-      ctx.globalAlpha = 0.6 * life;
-      ctx.fillStyle = '#fff6c3';
-      ctx.fillRect(0,-1.5, 10, 3);
-      ctx.restore();
-      ctx.globalAlpha = 1;
+      const life = Math.max(0, 1 - age/120); if(life<=0) continue;
+      ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+      // pressure cone (fast, tight) -- Wick gas-tear vibe
+      ctx.globalAlpha = 0.33 * life; ctx.fillStyle = '#f7f3d4';
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(16+age*0.04, 3.5); ctx.lineTo(16+age*0.04,-3.5); ctx.closePath(); ctx.fill();
+      // snap core
+      ctx.globalAlpha = 0.55 * life; ctx.fillStyle = '#fff6c3';
+      ctx.fillRect(0,-1.2, 8.5, 2.4);
+      ctx.restore(); ctx.globalAlpha=1;
     }
   }
 
   // damage numbers
   for(const d of world.dmg){
-    ctx.globalAlpha = d.alpha*0.9;
-    ctx.fillStyle = '#e8ecf2';
+    ctx.globalAlpha = d.alpha*0.9; ctx.fillStyle = '#e8ecf2';
     ctx.font = '600 12px -apple-system, system-ui, sans-serif';
     ctx.textAlign='center'; ctx.textBaseline='middle';
     ctx.fillText(d.txt, d.x, d.y);
@@ -251,17 +321,11 @@ function draw(now){
     ctx.fillStyle='#303844'; ctx.strokeStyle='#c8ccd2'; ctx.lineWidth=2;
     ctx.fillRect(dummy.x-dummy.w/2, dummy.y-dummy.h/2, dummy.w, dummy.h);
     ctx.strokeRect(dummy.x-dummy.w/2, dummy.y-dummy.h/2, dummy.w, dummy.h);
-    // hp pips
-    for(let i=0;i<dummy.hp;i++){
-      ctx.fillStyle='#ff7575';
-      ctx.fillRect(dummy.x-12+i*8, dummy.y-dummy.h/2-8, 6, 4);
-    }
+    for(let i=0;i<dummy.hp;i++){ ctx.fillStyle='#ff7575'; ctx.fillRect(dummy.x-12+i*8,dummy.y-dummy.h/2-8,6,4); }
   }
 
   // player
-  ctx.save();
-  ctx.translate(player.x, player.y);
-  ctx.rotate(player.rot);
+  ctx.save(); ctx.translate(player.x, player.y); ctx.rotate(player.rot);
   ctx.fillStyle='#e7ecf2'; ctx.beginPath(); ctx.arc(0,0,player.r,0,Math.PI*2); ctx.fill();
   ctx.strokeStyle='#87a6ff'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(player.r+10,0); ctx.stroke();
   ctx.restore();
