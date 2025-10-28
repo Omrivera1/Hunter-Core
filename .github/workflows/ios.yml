@@ -22,7 +22,7 @@ jobs:
       - name: Prepare Capacitor iOS project
         run: |
           set -e
-          npm run build || true        # makes ./dist from /www via our script
+          npm run build || true              # builds www -> dist
           npx cap init "HUNTER" "com.moises.hunter" --web-dir=dist || true
           npx cap add ios || true
           npx cap sync ios
@@ -30,23 +30,31 @@ jobs:
       - name: Ensure CocoaPods & install pods
         run: |
           set -e
-          pod --version
           cd ios/App
           pod install --repo-update
 
-      - name: Build Xcode archive
+      - name: Build Xcode archive (NO CODE SIGN)
         run: |
           set -e
-          xcodebuild -workspace ios/App/App.xcworkspace \
-            -scheme App -configuration Release \
-            -archivePath $PWD/build/App.xcarchive archive
+          xcodebuild \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath $PWD/build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            archive
 
       - name: Export unsigned IPA
         run: |
           set -e
           mkdir -p build/ipa
           APP_PATH=$(find $PWD/build/App.xcarchive/Products/Applications -name "*.app" | head -n1)
-          mkdir -p Payload && cp -R "$APP_PATH" Payload/
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
           /usr/bin/zip -r build/ipa/HUNTER-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
