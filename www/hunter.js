@@ -1,248 +1,543 @@
-/* HUNTER-CORE r20 baseline
-   - Smooth aim, capped recoil, AUTO/SEMI/BURST, L2 zoom
-   - Grid, walls, circle-vs-rect collision, no edge jitter
-   - Bullet trail + impact sparks, turret-bot enemy with drag
-   - Portrait-safe letterbox and instant error guard (no blank screens)
+/* HUNTER-CORE r19
+   - Faster base run + L3 sprint (hold)
+   - Smooth, non-snappy aim
+   - John Wick-ish shot: crisp muzzle flash + thin "laser" trail
+   - Auto fire by default; semi & burst supported internally
+   - Recoil tamed (never exceeds movement accel)
+   - Enemies less slippery
+   - Subtle neon grid + accent colors (no extra files)
 */
-(() => {
-  // ----- SAFE START -----
-  const canvas = document.getElementById('c');
-  if (!canvas) { alert('Canvas missing'); return; }
-  const ctx = canvas.getContext('2d', { alpha:false });
 
-  // ----- CONFIG -----
-  const CFG = {
-    world:{ w:3200, h:2000, grid:64, bg:'#0f1620', gridc:'#1b2430' },
-    pad:{ dz:0.17 },
-    cam:{ lerp:10 },
-    player:{
-      r:22, accel:2900, max:470, fric:0.78,
-      turn:7.0, recoil:52, recoilCapMul:1.0,
-      zoom:{ normal:1.0, aim:1.25, lerp:6 }
-    },
-    bullet:{
-      spd:1650, life:1.0, r:4,
-      trailW:5, trailNodes:14, dmg:12,
-      burstCount:3, burstGap:0.055
-    },
-    fire:{ mode:'semi', rpmAuto:540, rpmSemiGuard:12 },
-    enemy:{ w:86, h:64, hp:140, fric:0.60, knock:90 }
+(() => {
+  // ---------- Canvas / Setup ----------
+  const canvas = document.getElementById('c') || (() => {
+    const el = document.createElement('canvas');
+    el.id = 'c';
+    document.body.appendChild(el);
+    return el;
+  })();
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  const state = {
+    t: 0,
+    dt: 0,
+    last: performance.now(),
+    gamepad: null,
+    hasPad: false,
   };
 
-  // ----- STATE -----
-  const S={ t:0, dt:0, pads:[], mode:CFG.fire.mode, lastShot:0, burstLeft:0, burstT:0,
-            zoom:CFG.player.zoom.normal, zoomTo:CFG.player.zoom.normal,
-            hasPad:false, hudMode:CFG.fire.mode.toUpperCase() };
-  const P={ x:1600, y:1000, vx:0, vy:0, aim:0, aimTo:0 };
-  const E={ x:2200, y:950, w:CFG.enemy.w, h:CFG.enemy.h, vx:0, vy:0, hp:CFG.enemy.hp, alive:true, flash:0 };
-  const boxes=[ {x:1350,y:980,w:260,h:120}, {x:2500,y:1160,w:180,h:180}, {x:3000,y:760,w:140,h:420} ];
-  const bullets=[], sparks=[];
-  const cam={ x:0,y:0,w:0,h:0 };
-  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
-  const lerp=(a,b,t)=>a+(b-a)*Math.max(0,Math.min(1,t));
-  const angLerp=(a,b,t)=>{ let d=((b-a+Math.PI*3)%(Math.PI*2))-Math.PI; return a+d*Math.max(0,Math.min(1,t)); };
-  const len=(x,y)=>Math.hypot(x,y);
-
-  // ----- RESIZE / LETTERBOX -----
-  function resize(){
-    canvas.width = innerWidth * devicePixelRatio;
-    canvas.height = innerHeight * devicePixelRatio;
-    ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
-    cam.w = canvas.width / devicePixelRatio;
-    cam.h = canvas.height / devicePixelRatio;
+  function resize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    canvas.width  = Math.floor(w * DPR);
+    canvas.height = Math.floor(h * DPR);
+    canvas.style.width  = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   }
-  addEventListener('resize', resize); resize();
+  addEventListener('resize', resize);
+  resize();
 
-  // ----- INPUT -----
-  const keys=Object.create(null);
-  addEventListener('keydown',e=>keys[e.code]=true);
-  addEventListener('keyup',e=>keys[e.code]=false);
-  const eat=code => (keys[code]? (keys[code]=false,true):false);
-  let prevBtns=[];
-  const pads=()=>{ const a=navigator.getGamepads?.()||[]; S.pads=[]; S.hasPad=false; for(const p of a) if(p){S.pads.push(p); S.hasPad=true;} };
-  const dz=v=> (Math.abs(v)<CFG.pad.dz?0:v);
-  const just=(gp,i)=>{ const n=!!(gp.buttons[i]?.pressed); const w=prevBtns[i]||false; prevBtns[i]=n; return n&&!w; };
+  // ---------- Palette (neon-noir) ----------
+  const PAL = {
+    bgA: '#0e1522',     // deep navy
+    bgB: '#111a2a',
+    gridA: 'rgba(255,255,255,0.03)',
+    gridB: 'rgba(255,255,255,0.015)',
+    player: '#e6eefc',
+    playerEdge: '#91a8ff',
+    barrel: '#8ab4ff',
+    trail: '#7db1ff',
+    muzzle: '#ffe6ad',
+    sparkHot: '#ff6a6a',
+    sparkCold: '#ffb86b',
+    enemy: '#3e4a5f',
+    enemyEdge: '#9ad4ff',
+    hud: 'rgba(255,255,255,0.5)',
+  };
 
-  function readInput(){
-    const gp=S.pads[0];
-    let lx=0,ly=0,rx=0,ry=0, fireHeld=false, fireEdge=false, zoomHeld=false, cycle=false;
-    if(gp){
-      lx=dz(gp.axes[0]||0); ly=dz(gp.axes[1]||0);
-      rx=dz(gp.axes[2]||0); ry=dz(gp.axes[3]||0);
-      fireHeld=!!(gp.buttons[7]?.pressed); fireEdge=just(gp,7); // R2
-      zoomHeld=!!(gp.buttons[6]?.pressed);                      // L2
-      cycle=just(gp,3);                                         // Y/Triangle
-    }else{
-      lx=(keys.KeyD?1:0)-(keys.KeyA?1:0); ly=(keys.KeyS?1:0)-(keys.KeyW?1:0);
-      fireHeld=!!keys.Space; fireEdge=eat('Space'); zoomHeld=!!keys.ShiftLeft||!!keys.ShiftRight;
-      cycle=eat('KeyF');
+  // ---------- Input (Gamepad) ----------
+  const PAD = {
+    LX: 0, LY: 1, RX: 2, RY: 3,
+    BTN_A: 0, BTN_B: 1, BTN_X: 2, BTN_Y: 3,
+    L1: 4, R1: 5, L2: 6, R2: 7,
+    SELECT: 8, START: 9, L3: 10, R3: 11,
+  };
+
+  addEventListener('gamepadconnected', e => {
+    state.hasPad = true;
+    state.gamepad = navigator.getGamepads()[e.gamepad.index];
+  });
+  addEventListener('gamepaddisconnected', () => {
+    state.hasPad = !!navigator.getGamepads()[0];
+  });
+
+  function getPad() {
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (const p of pads) if (p) return p;
+    return null;
+  }
+
+  const input = {
+    move: { x:0, y:0 },
+    aim:  { x:1, y:0 },
+    fireHeld: false,
+    l3Held: false,
+  };
+
+  function readInput() {
+    const p = getPad();
+    if (!p) { input.move.x = input.move.y = 0; return; }
+
+    function dead(v, d=0.15) { return Math.abs(v) < d ? 0 : v; }
+
+    const lx = dead(p.axes[PAD.LX] || 0);
+    const ly = dead(p.axes[PAD.LY] || 0);
+    const rx = dead(p.axes[PAD.RX] || 0);
+    const ry = dead(p.axes[PAD.RY] || 0);
+
+    input.move.x = lx;
+    input.move.y = ly;
+
+    // If right stick is idle, keep aim; else update
+    if (rx !== 0 || ry !== 0) {
+      input.aim.x = rx;
+      input.aim.y = ry;
     }
-    if(cycle){ S.mode = S.mode==='auto' ? 'semi' : S.mode==='semi' ? 'burst' : 'auto'; S.hudMode = S.mode.toUpperCase(); }
-    return {lx,ly,rx,ry,fireHeld,fireEdge,zoomHeld};
+
+    const r2 = p.buttons[PAD.R2]?.value ?? 0;
+    input.fireHeld = r2 > 0.5 || p.buttons[PAD.R1]?.pressed;
+
+    input.l3Held = !!p.buttons[PAD.L3]?.pressed; // Sprint when held
   }
 
-  // ----- COLLISION -----
-  function circleVsRects(p,r,rects){
-    for(const b of rects){
-      const nx=clamp(p.x,b.x,b.x+b.w), ny=clamp(p.y,b.y,b.y+b.h);
-      const dx=p.x-nx, dy=p.y-ny, d2=dx*dx+dy*dy, rr=r*r;
-      if(d2<rr){
-        const d=Math.max(0.001,Math.sqrt(d2)), px=dx/d, py=dy/d, push=r-d;
-        p.x+=px*push; p.y+=py*push;
-        const vn=p.vx*px+p.vy*py; if(vn<0){ p.vx-=vn*px; p.vy-=vn*py; }
+  // ---------- World / Physics ----------
+  const world = {
+    grid: 64,
+    friction: 8.0,          // strong damp => snappy stop
+    accel: 1000,            // movement "engine"
+    baseSpeed: 310,         // faster baseline
+    sprintMult: 1.55,       // L3 sprint
+    recoilPush: 120,        // capped by accel handling below
+    boundsPad: 48,
+    obstacles: [
+      { x: 0.58, y: 0.62, w: 0.18, h: 0.11 },
+      { x: 0.78, y: 0.28, w: 0.07, h: 0.28 },
+      { x: 0.35, y: 0.43, w: 0.18, h: 0.10 },
+    ],
+  };
+
+  function pxRect(r) {
+    return {
+      x: r.x * canvas.width / DPR,
+      y: r.y * canvas.height / DPR,
+      w: r.w * canvas.width / DPR,
+      h: r.h * canvas.height / DPR,
+    };
+  }
+
+  // ---------- Player / Enemy / Gun ----------
+  const player = {
+    x: canvas.width/(DPR*2), y: canvas.height/(DPR*2),
+    vx:0, vy:0,
+    angle: 0,
+    targetAngle: 0,
+    aimSmooth: 0.18,     // lower = smoother
+    radius: 18,
+  };
+
+  const enemy = {
+    x: canvas.width/(DPR*2) + 260,
+    y: canvas.height/(DPR*2) - 20,
+    w: 60, h: 46,
+    vx:0, vy:0,
+    friction: 12.0,        // stickier so it doesn’t skate
+    hp: 100,
+    maxHp: 100,
+  };
+
+  const weapon = {
+    mode: 'auto',          // 'auto' | 'semi' | 'burst'
+    rpm: 600,              // auto cadence
+    burstSize: 3,
+    burstGap: 0.06,
+    semiReady: true,
+    cd: 0,                 // cooldown
+    muzzleFlash: 0,
+  };
+
+  const bullets = [];
+  const sparks  = [];
+
+  function shoot(dirX, dirY) {
+    // Fire cadence
+    if (weapon.cd > 0) return;
+
+    const speed = 1400;           // fast JW feel
+    const life  = 0.9;            // seconds
+    const bx = player.x + Math.cos(player.angle)*player.radius;
+    const by = player.y + Math.sin(player.angle)*player.radius;
+
+    bullets.push({
+      x: bx, y: by,
+      vx: dirX * speed,
+      vy: dirY * speed,
+      life, age: 0,
+      // trail samples
+      tail: [{x:bx, y:by, a:1}],
+    });
+
+    // Muzzle flash (very brief)
+    weapon.muzzleFlash = 0.05;
+
+    // Recoil (clamped so it never beats movement accel effect)
+    const recoilMag = Math.min(world.recoilPush, world.accel*0.14);
+    player.vx -= dirX * recoilMag;
+    player.vy -= dirY * recoilMag;
+
+    // Cooldown
+    weapon.cd = 60/weapon.rpm; // seconds per shot
+  }
+
+  // Fire controller
+  let burstLeft = 0, burstTimer = 0;
+  function updateFire(dt) {
+    weapon.cd = Math.max(0, weapon.cd - dt);
+    weapon.muzzleFlash = Math.max(0, weapon.muzzleFlash - dt);
+
+    const aimLen = Math.hypot(input.aim.x, input.aim.y) || 1;
+    const dx = input.aim.x / aimLen;
+    const dy = input.aim.y / aimLen;
+
+    switch (weapon.mode) {
+      case 'auto':
+        if (input.fireHeld) shoot(dx, dy);
+        break;
+
+      case 'semi':
+        if (input.fireHeld && weapon.semiReady) {
+          shoot(dx, dy);
+          weapon.semiReady = false;
+        }
+        if (!input.fireHeld) weapon.semiReady = true;
+        break;
+
+      case 'burst':
+        if (input.fireHeld && weapon.semiReady && burstLeft === 0) {
+          burstLeft = weapon.burstSize;
+          burstTimer = 0;
+          weapon.semiReady = false;
+        }
+        if (!input.fireHeld && burstLeft === 0) weapon.semiReady = true;
+
+        if (burstLeft > 0) {
+          burstTimer -= dt;
+          if (burstTimer <= 0) {
+            shoot(dx, dy);
+            burstLeft--;
+            burstTimer = weapon.burstGap;
+          }
+        }
+        break;
+    }
+  }
+
+  // ---------- Simulation ----------
+  function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function collideWorld(obj, radius=0) {
+    // Walls = screen edges minus padding
+    const W = canvas.width / DPR;
+    const H = canvas.height / DPR;
+    const pad = world.boundsPad;
+
+    if (obj.x < pad + radius) { obj.x = pad + radius; obj.vx = Math.max(0, obj.vx); }
+    if (obj.x > W - pad - radius){ obj.x = W - pad - radius; obj.vx = Math.min(0, obj.vx); }
+    if (obj.y < pad + radius) { obj.y = pad + radius; obj.vy = Math.max(0, obj.vy); }
+    if (obj.y > H - pad - radius){ obj.y = H - pad - radius; obj.vy = Math.min(0, obj.vy); }
+
+    // Static obstacles
+    for (const o of world.obstacles) {
+      const r = pxRect(o);
+      if (rectsOverlap(obj.x-radius, obj.y-radius, radius*2, radius*2, r.x, r.y, r.w, r.h)) {
+        // simple push out along smallest axis
+        const cx = Math.max(r.x, Math.min(obj.x, r.x+r.w));
+        const cy = Math.max(r.y, Math.min(obj.y, r.y+r.h));
+        const dx = obj.x - cx;
+        const dy = obj.y - cy;
+        if (Math.abs(dx) > Math.abs(dy)) {
+          obj.x = dx > 0 ? r.x + r.w + radius : r.x - radius;
+          obj.vx = 0;
+        } else {
+          obj.y = dy > 0 ? r.y + r.h + radius : r.y - radius;
+          obj.vy = 0;
+        }
       }
     }
   }
 
-  // ----- GAMEPLAY -----
-  function spawnBullet(x,y,a){
-    const b={ x, y, vx:Math.cos(a)*CFG.bullet.spd, vy:Math.sin(a)*CFG.bullet.spd, t:0, life:CFG.bullet.life, trail:[] };
-    bullets.push(b);
-    // recoil (capped)
-    P.vx -= Math.cos(a)*CFG.player.recoil;
-    P.vy -= Math.sin(a)*CFG.player.recoil;
-    const s=len(P.vx,P.vy), cap=CFG.player.max*CFG.player.recoilCapMul; if(s>cap){const k=cap/s; P.vx*=k; P.vy*=k;}
-  }
-  function muzzle(){ const a=P.aim, r=CFG.player.r+8; spawnBullet(P.x+Math.cos(a)*r, P.y+Math.sin(a)*r, a); }
+  function update(dt) {
+    readInput();
 
-  function fireLogic(inp,dt){
-    const now=S.t;
-    if(S.mode==='auto'){
-      const gap=60/CFG.fire.rpmAuto; if(inp.fireHeld && now-S.lastShot>=gap){ muzzle(); S.lastShot=now; }
-    }else if(S.mode==='semi'){
-      if(inp.fireEdge && now-S.lastShot>(1/CFG.fire.rpmSemiGuard)){ muzzle(); S.lastShot=now; }
-    }else{
-      if(inp.fireEdge && S.burstLeft===0){ S.burstLeft=CFG.bullet.burstCount; S.burstT=0; }
-      if(S.burstLeft>0){ S.burstT-=dt; if(S.burstT<=0){ muzzle(); S.burstLeft--; S.burstT=CFG.bullet.burstGap; } }
-    }
-  }
+    // Aim smoothing to prevent snap
+    const target = Math.atan2(input.aim.y, input.aim.x);
+    // shortest angular difference
+    let da = ((target - player.angle + Math.PI*3) % (Math.PI*2)) - Math.PI;
+    player.angle += da * player.aimSmooth;
 
-  function spark(x,y,a){
-    for(let i=0;i<10;i++){
-      const ang=a+(Math.random()-0.5)*0.8, sp=220+Math.random()*220;
-      sparks.push({x,y,vx:Math.cos(ang)*sp,vy:Math.sin(ang)*sp,t:0,life:0.25});
-    }
-  }
+    // Movement: accelerate toward stick direction, with sprint on L3
+    const mag = Math.min(1, Math.hypot(input.move.x, input.move.y));
+    const mx = mag ? (input.move.x / Math.hypot(input.move.x, input.move.y)) : 0;
+    const my = mag ? (input.move.y / Math.hypot(input.move.x, input.move.y)) : 0;
 
-  function stepBullets(dt){
-    for(let i=bullets.length-1;i>=0;--i){
-      const b=bullets[i]; b.t+=dt; b.x+=b.vx*dt; b.y+=b.vy*dt;
-      b.trail.push({x:b.x,y:b.y}); if(b.trail.length>CFG.bullet.trailNodes) b.trail.shift();
-      let hit=false;
-      if(b.x<0||b.y<0||b.x>CFG.world.w||b.y>CFG.world.h) hit=true;
-      else for(const bx of boxes){ if(b.x>bx.x&&b.x<bx.x+bx.w&&b.y>bx.y&&b.y<bx.y+bx.h){ hit=true; break; } }
-      if(!hit && E.alive && b.x>E.x && b.x<E.x+E.w && b.y>E.y && b.y<E.y+E.h){
-        hit=true; E.hp-=CFG.bullet.dmg; E.flash=0.08;
-        const a=Math.atan2(b.vy,b.vx); E.vx+=Math.cos(a)*CFG.enemy.knock; E.vy+=Math.sin(a)*CFG.enemy.knock;
-        if(E.hp<=0) E.alive=false;
+    const speed = world.baseSpeed * (input.l3Held ? world.sprintMult : 1);
+    const ax = mx * world.accel;
+    const ay = my * world.accel;
+
+    // integrate
+    // steer velocity toward desired using acceleration
+    const desiredVx = mx * speed;
+    const desiredVy = my * speed;
+
+    // accelerate toward desired, also apply friction
+    player.vx += (desiredVx - player.vx) * Math.min(1, dt * 10); // quick responsiveness
+    player.vy += (desiredVy - player.vy) * Math.min(1, dt * 10);
+
+    // base friction (small) so idle settles nicely
+    const f = Math.exp(-world.friction * dt);
+    player.vx *= f; player.vy *= f;
+
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    collideWorld(player, player.radius);
+
+    // Fire
+    updateFire(dt);
+
+    // Bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.age += dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+
+      // trail
+      if (!b.tail || b.tail.length === 0) b.tail = [{x:b.x, y:b.y, a:1}];
+      const last = b.tail[b.tail.length-1];
+      const dx = b.x - last.x, dy = b.y - last.y;
+      if (dx*dx + dy*dy > 40) { // sample spacing
+        b.tail.push({ x:b.x, y:b.y, a: 1 });
+        if (b.tail.length > 10) b.tail.shift();
       }
-      if(hit || b.t>=b.life){ spark(b.x,b.y,Math.atan2(b.vy,b.vx)); bullets.splice(i,1); }
-    }
-  }
+      // fade
+      for (let t of b.tail) t.a *= 0.98;
 
-  function stepSparks(dt){
-    for(let i=sparks.length-1;i>=0;--i){ const s=sparks[i]; s.t+=dt; s.vx*=0.92; s.vy*=0.92; s.x+=s.vx*dt; s.y+=s.vy*dt; if(s.t>=s.life) sparks.splice(i,1); }
-  }
+      // collide with enemy
+      if (rectsOverlap(b.x-2, b.y-2, 4, 4, enemy.x-enemy.w/2, enemy.y-enemy.h/2, enemy.w, enemy.h)) {
+        enemy.hp = Math.max(0, enemy.hp - 8);
+        enemy.vx += (b.vx)*0.02;
+        enemy.vy += (b.vy)*0.02;
 
-  function stepEnemy(dt){
-    if(!E.alive) return;
-    E.x+=E.vx*dt; E.y+=E.vy*dt;
-    E.vx*=Math.pow(CFG.enemy.fric,Math.max(1,60*dt));
-    E.vy*=Math.pow(CFG.enemy.fric,Math.max(1,60*dt));
-    E.x=clamp(E.x,0,CFG.world.w-E.w); E.y=clamp(E.y,0,CFG.world.h-E.h);
-    if(E.flash>0) E.flash-=dt;
-  }
+        spawnSparks(b.x, b.y, Math.atan2(b.vy, b.vx));
+        bullets.splice(i, 1);
+        continue;
+      }
 
-  function stepPlayer(inp,dt){
-    // zoom
-    S.zoomTo = inp.zoomHeld ? CFG.player.zoom.aim : CFG.player.zoom.normal;
-    S.zoom = lerp(S.zoom, S.zoomTo, Math.min(1, CFG.player.zoom.lerp*dt));
-    // move
-    P.vx += inp.lx * CFG.player.accel * dt;
-    P.vy += inp.ly * CFG.player.accel * dt;
-    const sp=len(P.vx,P.vy); if(sp>CFG.player.max){ const k=CFG.player.max/sp; P.vx*=k; P.vy*=k; }
-    P.vx*=Math.pow(CFG.player.fric,Math.max(1,60*dt)); P.vy*=Math.pow(CFG.player.fric,Math.max(1,60*dt));
-    P.x+=P.vx*dt; P.y+=P.vy*dt;
-    circleVsRects(P, CFG.player.r, boxes);
-    P.x=clamp(P.x, CFG.player.r, CFG.world.w-CFG.player.r);
-    P.y=clamp(P.y, CFG.player.r, CFG.world.h-CFG.player.r);
-    // aim
-    if(Math.abs(inp.rx)>0||Math.abs(inp.ry)>0) P.aimTo=Math.atan2(inp.ry,inp.rx);
-    P.aim=angLerp(P.aim,P.aimTo,Math.min(1,CFG.player.turn*dt));
-  }
+      // collide with obstacles or bounds
+      let hit = false;
+      const W = canvas.width/DPR, H = canvas.height/DPR;
+      if (b.x < world.boundsPad || b.x > W - world.boundsPad ||
+          b.y < world.boundsPad || b.y > H - world.boundsPad) hit = true;
 
-  function stepCam(){ cam.x=clamp(P.x-cam.w*0.5/S.zoom,0,CFG.world.w-cam.w/S.zoom); cam.y=clamp(P.y-cam.h*0.5/S.zoom,0,CFG.world.h-cam.h/S.zoom); }
+      for (const o of world.obstacles) {
+        const r = pxRect(o);
+        if (rectsOverlap(b.x-1, b.y-1, 2, 2, r.x, r.y, r.w, r.h)) { hit = true; break; }
+      }
 
-  // ----- RENDER -----
-  function drawGrid(){
-    ctx.fillStyle=CFG.world.bg; ctx.fillRect(0,0,cam.w,cam.h);
-    ctx.save(); ctx.translate(-cam.x,-cam.y); ctx.strokeStyle=CFG.world.gridc; ctx.globalAlpha=0.6; ctx.lineWidth=1;
-    for(let x=0;x<=CFG.world.w;x+=CFG.world.grid){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,CFG.world.h); ctx.stroke(); }
-    for(let y=0;y<=CFG.world.h;y+=CFG.world.grid){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CFG.world.w,y); ctx.stroke(); }
-    ctx.restore(); ctx.globalAlpha=1;
-  }
-  function beginW(){ ctx.save(); ctx.scale(S.zoom,S.zoom); ctx.translate(-cam.x,-cam.y); }
-  function endW(){ ctx.restore(); }
-  function drawBoxes(){ ctx.fillStyle='rgba(80,90,110,0.35)'; ctx.strokeStyle='rgba(180,200,220,0.25)'; for(const b of boxes){ ctx.fillRect(b.x,b.y,b.w,b.h); ctx.strokeRect(b.x,b.y,b.w,b.h); } }
-  function drawEnemy(){
-    if(!E.alive) return;
-    ctx.save(); if(E.flash>0) ctx.globalAlpha=0.6;
-    const r=12,x=E.x,y=E.y,w=E.w,h=E.h;
-    ctx.fillStyle='#445064'; ctx.strokeStyle='#b8c6d8'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.moveTo(x+r,y);
-    ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
-    ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r);
-    ctx.closePath(); ctx.fill(); ctx.stroke();
-    ctx.fillStyle='#56647a'; ctx.beginPath(); ctx.arc(x+w*0.75,y-6,10,Math.PI,0); ctx.fill();
-    ctx.fillStyle='#8bd1ff'; ctx.fillRect(x+w*0.72,y-10,8,4);
-    const p=Math.max(0,Math.min(1,E.hp/CFG.enemy.hp)); ctx.fillStyle='#ff6161'; ctx.fillRect(x,y-14,w,6);
-    ctx.fillStyle='#4af59a'; ctx.fillRect(x,y-14,w*p,6);
-    ctx.restore();
-  }
-  function drawPlayer(){
-    const L=36, b1x=P.x+Math.cos(P.aim)*8, b1y=P.y+Math.sin(P.aim)*8;
-    const b2x=P.x+Math.cos(P.aim)*(8+L), b2y=P.y+Math.sin(P.aim)*(8+L);
-    ctx.strokeStyle='#7da7ff'; ctx.lineWidth=6; ctx.lineCap='round';
-    ctx.beginPath(); ctx.moveTo(b1x,b1y); ctx.lineTo(b2x,b2y); ctx.stroke();
-    ctx.fillStyle='#e9eef7'; ctx.beginPath(); ctx.arc(P.x,P.y,CFG.player.r,0,Math.PI*2); ctx.fill();
-  }
-  function drawBullets(){
-    for(const b of bullets){
-      if(b.trail.length>=2){
-        ctx.save(); ctx.strokeStyle='#6aa0ff'; ctx.lineCap='round';
-        for(let i=1;i<b.trail.length;i++){
-          const a=i/(b.trail.length-1); ctx.globalAlpha=(1-a)*0.6;
-          ctx.lineWidth=CFG.bullet.trailW - a*(CFG.bullet.trailW-1);
-          const p0=b.trail[i-1], p1=b.trail[i]; ctx.beginPath(); ctx.moveTo(p0.x,p0.y); ctx.lineTo(p1.x,p1.y); ctx.stroke();
-        } ctx.restore();
+      if (hit || b.age > b.life) {
+        spawnSparks(b.x, b.y, Math.atan2(b.vy, b.vx));
+        bullets.splice(i, 1);
       }
     }
-    ctx.fillStyle='#dfe8ff'; for(const b of bullets){ ctx.beginPath(); ctx.arc(b.x,b.y,CFG.bullet.r,0,Math.PI*2); ctx.fill(); }
-  }
-  function drawSparks(){ ctx.fillStyle='#9ec7ff'; for(const s of sparks){ const a=1-(s.t/s.life); ctx.globalAlpha=a; ctx.fillRect(s.x-1.5,s.y-1.5,3,3); } ctx.globalAlpha=1; }
-  function drawHUD(){
-    ctx.save(); ctx.setTransform(1,0,0,1,0,0);
-    ctx.fillStyle='rgba(20,26,34,0.75)'; ctx.fillRect(14,14,260,68);
-    ctx.fillStyle='#cfe2ff'; ctx.font='16px system-ui,-apple-system,Segoe UI,Roboto,sans-serif';
-    ctx.fillText(S.hasPad?'Controller ✓':'Controller ?',28,40);
-    ctx.fillText('Mode: '+S.hudMode,28,64);
-    const msg='Controller OK', w=ctx.measureText(msg).width;
-    ctx.fillStyle='rgba(20,26,34,0.6)'; ctx.fillRect(12, cam.h-34, w+16, 26);
-    ctx.fillStyle='#cfe2ff'; ctx.fillText(msg, 20, cam.h-16);
-    ctx.restore();
+
+    // Enemy friction & movement
+    const ef = Math.exp(-enemy.friction * dt);
+    enemy.vx *= ef; enemy.vy *= ef;
+    enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
+
+    // Keep enemy on screen
+    enemy.x = Math.max(world.boundsPad+enemy.w/2, Math.min(canvas.width/DPR-world.boundsPad-enemy.w/2, enemy.x));
+    enemy.y = Math.max(world.boundsPad+enemy.h/2, Math.min(canvas.height/DPR-world.boundsPad-enemy.h/2, enemy.y));
+
+    // Sparks
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.age += dt;
+      s.vx *= 0.98; s.vy = s.vy*0.98 + 600*dt*0.15; // slight fall
+      s.x += s.vx * dt; s.y += s.vy * dt;
+      if (s.age > s.life) sparks.splice(i, 1);
+    }
   }
 
-  // ----- LOOP -----
-  let last=performance.now()/1000;
-  function tick(nowMs){
-    const now=nowMs/1000; S.dt=Math.min(0.033, now-last); last=now; S.t=now;
-    pads(); const inp=readInput();
-    stepPlayer(inp,S.dt); fireLogic(inp,S.dt); stepBullets(S.dt); stepSparks(S.dt); stepEnemy(S.dt); stepCam();
-    ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
-    drawGrid(); ctx.save(); ctx.scale(S.zoom,S.zoom); ctx.translate(-cam.x,-cam.y);
-    drawBoxes(); drawEnemy(); drawBullets(); drawSparks(); drawPlayer();
-    ctx.restore(); drawHUD(); ctx.restore();
-    requestAnimationFrame(tick);
+  function spawnSparks(x, y, angle) {
+    const N = 10 + (Math.random()*6|0);
+    for (let i=0;i<N;i++){
+      const a = angle + (Math.random()*0.8-0.4);
+      const sp = 220 + Math.random()*220;
+      sparks.push({
+        x, y,
+        vx: Math.cos(a)*sp,
+        vy: Math.sin(a)*sp,
+        age: 0,
+        life: 0.20 + Math.random()*0.25,
+      });
+    }
   }
-  requestAnimationFrame(tick);
+
+  // ---------- Render ----------
+  function drawGrid() {
+    const W = canvas.width/DPR, H = canvas.height/DPR;
+    ctx.fillStyle = PAL.bgA;
+    ctx.fillRect(0,0,W,H);
+
+    // subtle checker w/ gradient hue
+    const g = ctx.createLinearGradient(0,0,W,H);
+    g.addColorStop(0, PAL.bgA);
+    g.addColorStop(1, PAL.bgB);
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    const s = world.grid;
+    for (let y=0;y<H;y+=s) {
+      for (let x=0;x<W;x+=s) {
+        ctx.fillStyle = ((x/s + y/s) % 2 === 0) ? PAL.gridA : PAL.gridB;
+        ctx.fillRect(x, y, s, s);
+      }
+    }
+  }
+
+  function drawPlayer() {
+    // body
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, player.radius, 0, Math.PI*2);
+    ctx.fillStyle = PAL.player;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = PAL.playerEdge;
+    ctx.stroke();
+
+    // barrel (rotated line)
+    const bl = 28; // visible barrel
+    ctx.strokeStyle = PAL.barrel;
+    ctx.lineWidth = 6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(player.x, player.y);
+    ctx.lineTo(player.x + Math.cos(player.angle)*bl, player.y + Math.sin(player.angle)*bl);
+    ctx.stroke();
+
+    // muzzle flash (brief)
+    if (weapon.muzzleFlash > 0) {
+      const m = 10 + 10 * (weapon.muzzleFlash / 0.05);
+      ctx.fillStyle = PAL.muzzle;
+      ctx.beginPath();
+      ctx.arc(player.x + Math.cos(player.angle)*bl, player.y + Math.sin(player.angle)*bl, m*0.5, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawBullets() {
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    for (const b of bullets) {
+      // trail line (thin, bright, slight gradient)
+      const grad = ctx.createLinearGradient(b.x, b.y, b.x - b.vx*0.05, b.y - b.vy*0.05);
+      grad.addColorStop(0, 'rgba(140,190,255,0.9)');
+      grad.addColorStop(1, 'rgba(140,190,255,0.0)');
+      ctx.strokeStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(b.x, b.y);
+      // use last tail sample to extend behind
+      const t = b.tail[0] || {x:b.x, y:b.y};
+      ctx.lineTo(t.x, t.y);
+      ctx.stroke();
+
+      // core projectile
+      ctx.fillStyle = '#cfe2ff';
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 2.2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawSparks() {
+    for (const s of sparks) {
+      const r = 2.0 * (1 - s.age/s.life);
+      ctx.fillStyle = s.age < s.life*0.5 ? PAL.sparkHot : PAL.sparkCold;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, Math.max(0, r), 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawEnemy() {
+    // body
+    ctx.fillStyle = PAL.enemy;
+    ctx.strokeStyle = PAL.enemyEdge;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.rect(enemy.x - enemy.w/2, enemy.y - enemy.h/2, enemy.w, enemy.h);
+    ctx.fill(); ctx.stroke();
+
+    // HP pips (JW-style)
+    const pips = Math.ceil((enemy.hp/enemy.maxHp)*8);
+    const top = enemy.y - enemy.h/2 - 10;
+    for (let i=0;i<8;i++){
+      ctx.fillStyle = i < pips ? '#ff6a6a' : 'rgba(255,255,255,0.15)';
+      ctx.fillRect(enemy.x-48 + i*12, top, 8, 4);
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = PAL.hud;
+    ctx.font = '14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillText('Controller '+(state.hasPad ? 'OK' : '?'), 16, canvas.height/DPR - 18);
+  }
+
+  function render() {
+    drawGrid();
+    // obstacles
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    for (const o of world.obstacles) {
+      const r = pxRect(o);
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeRect(r.x, r.y, r.w, r.h);
+    }
+
+    drawEnemy();
+    drawBullets();
+    drawSparks();
+    drawPlayer();
+    drawHUD();
+  }
+
+  // ---------- Main Loop ----------
+  function loop(now) {
+    state.dt = Math.min(0.033, (now - state.last) / 1000);
+    state.last = now;
+    state.t += state.dt;
+
+    update(state.dt);
+    render();
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
 })();
