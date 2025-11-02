@@ -1,11 +1,12 @@
-/* HUNTER-CORE r27 -- zombies/enrage/explode, strict collisions, fair burst, surface sparks */
+/* HUNTER-CORE r29 -- burst edge-trigger, proper sparks, no lingering bullets,
+   enemy fade + capped respawn (<=10), softer clamped shotgun shake, light map color pass */
 
 (() => {
   // ---------- Canvas ----------
   const c = document.getElementById('c') || (() => {
     const el=document.createElement('canvas'); el.id='c'; document.body.appendChild(el); return el;
   })();
-  const ctx = c.getContext('2d', {alpha:false});
+  const ctx = c.getContext('2d', { alpha:false });
   const DPR = Math.max(1, Math.min(3, devicePixelRatio||1));
   function resize(){ c.width=innerWidth*DPR; c.height=innerHeight*DPR; c.style.width=innerWidth+'px'; c.style.height=innerHeight+'px'; ctx.setTransform(DPR,0,0,DPR,0,0); }
   addEventListener('resize', resize); resize();
@@ -21,35 +22,44 @@
     bloodA:'#c22727', bloodB:'#7a1212',
     enemyBody:'#4b5a6f', enemyEdge:'#b2e2ff', enemyHead:'#d7ecff',
     enrageGlow:'#ff6262',
-    hud:'rgba(255,255,255,0.75)'
+    hud:'rgba(255,255,255,0.78)',
+    // obstacle accents
+    obs1:'rgba(255,124,76,0.08)', obs1s:'rgba(255,124,76,0.22)',
+    obs2:'rgba(114,179,255,0.08)', obs2s:'rgba(114,179,255,0.22)',
+    obs3:'rgba(153,255,204,0.08)', obs3s:'rgba(153,255,204,0.22)'
   };
 
   // ---------- World ----------
   const world = {
     W: 3600, H: 2400, grid: 64, bounds: 64,
     friction: 8, accel: 1000,
-    baseSpeed: 420, sprint: 1.55,               // faster baseline per your note
+    baseSpeed: 420, sprint: 1.55,
     recoilPush: 110,
     obstacles: []
   };
-  const rect=(x,y,w,h)=>({type:'rect',x,y,w,h});
-  const pill=(x,y,r)=>({type:'pill',x,y,r});
+  const rect=(x,y,w,h,cid=0)=>({type:'rect',x,y,w,h,cid});
+  const pill=(x,y,r,cid=0)=>({type:'pill',x,y,r,cid});
+  const OBS_COLS = [
+    {f:PAL.obs1, s:PAL.obs1s},
+    {f:PAL.obs2, s:PAL.obs2s},
+    {f:PAL.obs3, s:PAL.obs3s},
+  ];
   world.obstacles.push(
-    rect(900,520,260,80), rect(1480,380,120,360),
-    rect(2100,780,360,90), rect(2550,400,160,120),
-    rect(2900,1200,220,100), rect(800,1400,300,90),
-    rect(1600,1600,500,80), rect(2200,1840,160,380),
-    rect(400,1900,300,120), rect(3000,600,90,420),
-    pill(1200,1000,36), pill(1750,900,42), pill(2450,1350,38),
-    pill(3100,1550,46), pill(600,600,32)
+    rect(900,520,260,80,0), rect(1480,380,120,360,1),
+    rect(2100,780,360,90,2), rect(2550,400,160,120,0),
+    rect(2900,1200,220,100,1), rect(800,1400,300,90,2),
+    rect(1600,1600,500,80,0), rect(2200,1840,160,380,1),
+    rect(400,1900,300,120,2), rect(3000,600,90,420,0),
+    pill(1200,1000,36,1), pill(1750,900,42,2), pill(2450,1350,38,0),
+    pill(3100,1550,46,1), pill(600,600,32,2)
   );
 
   // ---------- Camera ----------
-  const cam={x:0,y:0,shake:0,shx:0,shy:0};
+  const cam={x:0,y:0, shake:0, shx:0, shy:0, maxShake:0.7}; // clamp
 
   // ---------- Input ----------
   const PAD={LX:0,LY:1,RX:2,RY:3,L1:4,R1:5,L2:6,R2:7,SELECT:8,START:9,L3:10,R3:11};
-  const input={move:{x:0,y:0}, aim:{x:1,y:0}, fire:false, l3:false, _l1:false};
+  const input={move:{x:0,y:0}, aim:{x:1,y:0}, fire:false, l3:false, _l1:false, _firePrev:false};
   function pad(){ const a=navigator.getGamepads?.()||[]; for(const p of a) if(p) return p; return null; }
   const dead=v=>Math.abs(v)<0.15?0:v;
   function readInput(){
@@ -63,96 +73,98 @@
     input.l3   = !!p.buttons[PAD.L3]?.pressed;
     const l1   = !!p.buttons[PAD.L1]?.pressed;
     if(l1 && !input._l1) cycleFireMode();
-    input._l1=l1;
+    input._l1 = l1;
   }
+  const fireEdge = () => input.fire && !input._firePrev;
 
   // ---------- Player ----------
   const player = {x:world.W/2,y:world.H/2,vx:0,vy:0,r:18,ang:0,aimSmooth:0.18,hp:120,maxHp:120};
 
   // ---------- Enemies ----------
   const enemies=[];
-  function spawnEnemies(n=10){
-    enemies.length=0;
-    for(let i=0;i<n;i++){
-      enemies.push({
-        x: 300+Math.random()*(world.W-600),
-        y: 300+Math.random()*(world.H-600),
-        vx:0,vy:0,w:58,h:50,r:14,
-        hp:110,maxHp:110,alive:true, fade:0,
-        touchDps:14, // damage per second when touching
-        // brain
-        state:'wander', tw:0, wx:0, wy:0, sight:560,
-        enraged:false, fuse:0
-      });
-    }
+  function spawnEnemy(){
+    // Spawn away from player
+    let x,y,tries=0;
+    do {
+      x = 200 + Math.random()*(world.W-400);
+      y = 200 + Math.random()*(world.H-400);
+      tries++;
+    } while (tries<20 && Math.hypot(x-player.x,y-player.y) < 600);
+    enemies.push({
+      x, y, vx:0, vy:0, w:58, h:50, r:14,
+      hp:130, maxHp:130, alive:true, fade:0, deadFadeTime:1.2,
+      touchDps:14, state:'wander', tw:0, wx:0, wy:0, sight:560,
+      enraged:false, fuse:0
+    });
   }
-  spawnEnemies();
+  function spawnEnemiesTo(max=10){
+    let alive = enemies.filter(e=>e.alive).length;
+    while(alive < max){ spawnEnemy(); alive++; }
+  }
+  spawnEnemiesTo(10);
 
   // ---------- Weapon / FX ----------
   const bullets=[], sparks=[], blood=[], decals=[];
   const weapon = {
     mode:'auto',
-    rpmAuto:720, rpmSemiCap:720,     // semi cannot exceed this
+    rpmAuto:720, rpmSemiCap:720,
     burstSize:3, burstGap:0.07,
     shotgunPellets:7, shotgunSpread:0.13,
     semiReady:true, cd:0, muzzle:0,
     bursting:false, burstQ:0, burstT:0, burstDir:[1,0]
   };
   function cycleFireMode(){ weapon.mode=({auto:'semi',semi:'burst',burst:'shotgun',shotgun:'auto'})[weapon.mode]; }
+  function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
 
   function fireRay(dx,dy){
     const sp=1600, tail=0.065;
-    const bx=player.x+Math.cos(player.ang)*player.r;
-    const by=player.y+Math.sin(player.ang)*player.r;
-    bullets.push({x:bx,y:by,px:bx,py:by,vx:dx*sp,vy:dy*sp,age:0,tail});
-    weapon.muzzle=0.05;
-    const rec=Math.min(world.recoilPush, world.accel*0.14);
-    player.vx-=dx*rec; player.vy-=dy*rec;
+    const bx=player.x+Math.cos(player.ang)*player.r, by=player.y+Math.sin(player.ang)*player.r;
+    bullets.push({x:bx,y:by, px:bx, py:by, vx:dx*sp, vy:dy*sp, age:0, life:1.2, tail});
+    weapon.muzzle = 0.05;
+    const rec = Math.min(world.recoilPush, world.accel*0.14);
+    player.vx -= dx*rec; player.vy -= dy*rec;
   }
 
-  function tryShoot(dx,dy){
-    if(weapon.cd>0) return;
-    switch(weapon.mode){
-      case 'auto':
+  function tryShoot(dx,dy,edge){
+    if(weapon.mode==='auto'){
+      if(weapon.cd<=0 && input.fire){ fireRay(dx,dy); weapon.cd = 60/weapon.rpmAuto; }
+    } else if(weapon.mode==='semi'){
+      if(edge && weapon.cd<=0 && weapon.semiReady){
         fireRay(dx,dy);
-        weapon.cd = 60/weapon.rpmAuto;
-        break;
-      case 'semi':
-        if(weapon.semiReady){
-          fireRay(dx,dy);
-          weapon.semiReady=false;
-          weapon.cd = Math.max(0.06, 60/weapon.rpmSemiCap); // hard cap so tapping can't outpace auto
-        }
-        break;
-      case 'burst':
-        if(!weapon.bursting){
-          weapon.bursting=true;
-          weapon.semiReady=false;
-          weapon.burstQ=weapon.burstSize;
-          weapon.burstT=0;
-          weapon.burstDir=[dx,dy];
-          weapon.cd = 60/weapon.rpmAuto; // cannot exceed auto tempo
-        }
-        break;
-      case 'shotgun': {
-        cam.shake+=0.5;
+        weapon.semiReady=false;
+        weapon.cd = Math.max(0.06, 60/weapon.rpmSemiCap); // hard cap
+      }
+    } else if(weapon.mode==='burst'){
+      // Burst only starts on edge, then locks until volley ends, requires release to re-arm
+      if(edge && !weapon.bursting && weapon.semiReady){
+        weapon.bursting = true;
+        weapon.semiReady = false;
+        weapon.burstQ = weapon.burstSize;
+        weapon.burstT = 0;
+        weapon.burstDir = [dx,dy];
+        weapon.cd = 60/weapon.rpmAuto; // pacing gate (can't outpace auto)
+      }
+    } else { // shotgun
+      if(weapon.cd<=0 && input.fire){
+        cam.shake = Math.min(cam.maxShake, cam.shake + 0.28); // softer per-shot
         const n=weapon.shotgunPellets, s=weapon.shotgunSpread;
         for(let i=0;i<n;i++){
           const a=Math.atan2(dy,dx)+(Math.random()*2-1)*s;
           fireRay(Math.cos(a),Math.sin(a));
         }
-        weapon.cd=0.22;
-      } break;
+        weapon.cd = 0.22;
+      }
     }
   }
 
-  function spawnSparks(x,y,ang,nx,ny){
+  function spawnSparks(x,y,ang,nx=0,ny=0){
     const N=12+(Math.random()*6|0);
     for(let i=0;i<N;i++){
       const a=ang+(Math.random()*0.8-0.4), sp=260+Math.random()*280;
-      sparks.push({x:x+nx*2,y:y+ny*2,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,age:0,life:0.18+Math.random()*0.25});
+      // small offset along surface normal so it renders on the face
+      sparks.push({x:x+nx*1.5,y:y+ny*1.5,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,age:0,life:0.2+Math.random()*0.25});
     }
-    decals.push({type:'debris',x,y,age:0,life:6,rot:Math.random()*6});
+    decals.push({type:'debris',x,y,age:0,life:5.5,rot:Math.random()*6});
   }
   function spawnBlood(x,y,ang){
     const N=16+(Math.random()*10|0);
@@ -160,39 +172,34 @@
       const a=ang+(Math.random()*1.0-0.5), sp=180+Math.random()*260;
       blood.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,age:0,life:0.25+Math.random()*0.35});
     }
-    decals.push({type:'blood',x,y,age:0,life:14,rot:Math.random()*6});
+    decals.push({type:'blood',x,y,age:0,life:10,rot:Math.random()*6});
   }
 
-  // ---------- Math / Collisions ----------
-  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  // ---------- Collision helpers ----------
   function aabb(ax,ay,aw,ah,bx,by,bw,bh){ return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by; }
-
-  // segment vs rect intersection (returns point & outward normal)
-  function segRectHit(x1,y1,x2,y2, rx,ry,rw,rh){
-    let tmin=0, tmax=1, nx=0, ny=0;
-    const dx=x2-x1, dy=y2-y1;
-
-    function slab(p, dp, smin, smax, nx_, ny_){
-      if(Math.abs(dp)<1e-6){ if(p<smin || p>smax) return false; return true; }
-      let t1=(smin-p)/dp, t2=(smax-p)/dp;
-      let n1=nx_, n2=-nx_, m1=ny_, m2=-ny_;
-      if(t1>t2){ [t1,t2]=[t2,t1]; [n1,n2]=[n2,n1]; [m1,m2]=[m2,m1]; }
-      if(t1>tmin){ tmin=t1; nx=n1; ny=m1; }
-      if(t2<tmax){ tmax=t2; }
-      return tmin<=tmax;
-    }
-    if(!slab(x1,dx,rx,rx+rw,1,0)) return null;
-    if(!slab(y1,dy,ry,ry+rh,0,1)) return null;
-    if(tmin<0 || tmin>1) return null;
-    return {x:x1+dx*tmin, y:y1+dy*tmin, nx, ny};
-  }
-
   function circleRectPush(cx,cy,r, rx,ry,rw,rh){
     const clx=clamp(cx,rx,rx+rw), cly=clamp(cy,ry,ry+rh);
     const dx=cx-clx, dy=cy-cly, d2=dx*dx+dy*dy;
     if(d2>r*r) return null;
     const d=Math.sqrt(d2)||1, nx=dx/d, ny=dy/d;
     return {nx,ny,pen:r-d};
+  }
+  // segment-rect hit gives surface point + outward normal
+  function segRectHit(x1,y1,x2,y2, rx,ry,rw,rh){
+    let tmin=0, tmax=1, nx=0, ny=0;
+    const dx=x2-x1, dy=y2-y1;
+    function slab(p, dp, smin, smax, nposx, nposy){
+      if(Math.abs(dp)<1e-6){ if(p<smin || p>smax) return false; return true; }
+      let t1=(smin-p)/dp, t2=(smax-p)/dp, n1=[nposx,nposy], n2=[-nposx,-nposy];
+      if(t1>t2){ [t1,t2]=[t2,t1]; [n1,n2]=[n2,n1]; }
+      if(t1>tmin){ tmin=t1; nx=n1[0]; ny=n1[1]; }
+      if(t2<tmax) tmax=t2;
+      return tmin<=tmax;
+    }
+    if(!slab(x1,dx,rx,rx+rw,1,0)) return null;
+    if(!slab(y1,dy,ry,ry+rh,0,1)) return null;
+    if(tmin<0 || tmin>1) return null;
+    return {x:x1+dx*tmin, y:y1+dy*tmin, nx, ny};
   }
 
   // ---------- Update ----------
@@ -212,112 +219,129 @@
     const f=Math.exp(-world.friction*dt); player.vx*=f; player.vy*=f;
     player.x+=player.vx*dt; player.y+=player.vy*dt;
 
-    // collide player with world
-    player.x=clamp(player.x, world.bounds+player.r, world.W-world.bounds-player.r);
-    player.y=clamp(player.y, world.bounds+player.r, world.H-world.bounds-player.r);
+    // player vs world
+    player.x = clamp(player.x, world.bounds+player.r, world.W-world.bounds-player.r);
+    player.y = clamp(player.y, world.bounds+player.r, world.H-world.bounds-player.r);
     for(const o of world.obstacles){
       if(o.type==='rect'){
-        const res=circleRectPush(player.x,player.y,player.r, o.x,o.y,o.w,o.h);
-        if(res){ player.x+=res.nx*res.pen; player.y+=res.ny*res.pen; if((player.vx*res.nx+player.vy*res.ny)<0){ player.vx-=res.nx*(player.vx*res.nx+player.vy*res.ny); player.vy-=res.ny*(player.vx*res.nx+player.vy*res.ny); } }
+        const res=circleRectPush(player.x,player.y,player.r,o.x,o.y,o.w,o.h);
+        if(res){ player.x+=res.nx*res.pen; player.y+=res.ny*res.pen;
+          const vn=player.vx*res.nx+player.vy*res.ny; if(vn<0){ player.vx-=vn*res.nx; player.vy-=vn*res.ny; } }
       } else {
-        const dx=player.x-o.x, dy=player.y-o.y, rr=player.r+o.r; if(dx*dx+dy*dy<rr*rr){ const d=Math.hypot(dx,dy)||1; const nx=dx/d, ny=dy/d; player.x=o.x+nx*rr; player.y=o.y+ny*rr; const vn=player.vx*nx+player.vy*ny; if(vn<0){ player.vx-=vn*nx; player.vy-=vn*ny; } }
+        const dx=player.x-o.x, dy=player.y-o.y, rr=player.r+o.r;
+        if(dx*dx+dy*dy<rr*rr){ const d=Math.hypot(dx,dy)||1, nx=dx/d, ny=dy/d;
+          player.x=o.x+nx*rr; player.y=o.y+ny*rr; const vn=player.vx*nx+player.vy*ny; if(vn<0){ player.vx-=vn*nx; player.vy-=vn*ny; } }
       }
     }
 
-    // camera
+    // camera (with clamp + soft decay + clamp max)
     const vw=c.width/DPR, vh=c.height/DPR;
     cam.x = clamp(player.x - vw/2, 0, world.W-vw);
     cam.y = clamp(player.y - vh/2, 0, world.H-vh);
-    if(cam.shake>0){ cam.shake=Math.max(0,cam.shake-dt*2); cam.shx=(Math.random()*2-1)*cam.shake*8; cam.shy=(Math.random()*2-1)*cam.shake*8; } else { cam.shx=cam.shy=0; }
+    cam.shake = Math.min(cam.maxShake, Math.max(0, cam.shake - dt*2.2));
+    cam.shx = (Math.random()*2-1) * cam.shake * 7;
+    cam.shy = (Math.random()*2-1) * cam.shake * 7;
 
-    // weapon timers
-    weapon.cd=Math.max(0,weapon.cd-dt); weapon.muzzle=Math.max(0,weapon.muzzle-dt);
-    if(weapon.mode==='semi'){ if(!input.fire) weapon.semiReady=true; }
+    // fire cadence
+    const al=Math.hypot(input.aim.x,input.aim.y)||1, dx=input.aim.x/al, dy=input.aim.y/al;
+    weapon.cd = Math.max(0, weapon.cd - dt);
+    weapon.muzzle = Math.max(0, weapon.muzzle - dt);
+
+    // manage burst volley
     if(weapon.bursting){
-      weapon.burstT-=dt;
+      weapon.burstT -= dt;
       if(weapon.burstQ>0 && weapon.burstT<=0){
-        const [dx,dy]=weapon.burstDir;
-        fireRay(dx,dy);
-        weapon.burstQ--; weapon.burstT=weapon.burstGap;
+        const [bx,by]=weapon.burstDir;
+        fireRay(bx,by);
+        weapon.burstQ--; weapon.burstT = weapon.burstGap;
       }
-      if(weapon.burstQ===0){ weapon.bursting=false; }
+      if(weapon.burstQ===0){ weapon.bursting=false; /* require release to re-arm */ }
     }
-    const al=Math.hypot(input.aim.x,input.aim.y)||1; if(input.fire) tryShoot(input.aim.x/al,input.aim.y/al);
+    if(weapon.mode==='semi' || weapon.mode==='burst'){
+      if(!input.fire) weapon.semiReady = true; // release to re-arm
+    }
+
+    // shoot with edge logic where required
+    const edge = fireEdge();
+    tryShoot(dx,dy,edge);
+    input._firePrev = input.fire;
 
     // bullets
-    for(let i=bullets.length-1;i>=0;i--){
-      const b=bullets[i]; b.age+=dt; b.px=b.x; b.py=b.y; b.x+=b.vx*dt; b.y+=b.vy*dt;
+    for (let i=bullets.length-1;i>=0;i--){
+      const b=bullets[i];
+      b.age += dt; b.px=b.x; b.py=b.y; b.x += b.vx*dt; b.y += b.vy*dt;
+      let removed = false;
 
-      let removed=false;
-
-      // obstacle hits (surface)
+      // obstacle surface check
       for(const o of world.obstacles){
         if(removed) break;
         if(o.type==='rect'){
-          const hit=segRectHit(b.px,b.py,b.x,b.y, o.x,o.y,o.w,o.h);
+          const hit = segRectHit(b.px,b.py,b.x,b.y, o.x,o.y,o.w,o.h);
           if(hit){
             spawnSparks(hit.x,hit.y, Math.atan2(b.vy,b.vx), hit.nx, hit.ny);
-            cam.shake+=0.1; bullets.splice(i,1); removed=true; break;
+            cam.shake = Math.min(cam.maxShake, cam.shake + 0.08);
+            bullets.splice(i,1); removed=true; break;
           }
         } else {
-          // approximate: circle slab via backstep to surface
-          const dx=b.x-o.x, dy=b.y-o.y, pr=o.r+2, d2=dx*dx+dy*dy;
-          if(d2<pr*pr){
+          // circle face: project to surface
+          const dx=b.x-o.x, dy=b.y-o.y, R=o.r+2, d2=dx*dx+dy*dy;
+          if(d2<R*R){
             const d=Math.sqrt(d2)||1, nx=dx/d, ny=dy/d;
-            const sx=o.x+nx*pr, sy=o.y+ny*pr;
+            const sx=o.x+nx*R, sy=o.y+ny*R;
             spawnSparks(sx,sy, Math.atan2(b.vy,b.vx), nx, ny);
-            cam.shake+=0.1; bullets.splice(i,1); removed=true; break;
+            cam.shake = Math.min(cam.maxShake, cam.shake + 0.08);
+            bullets.splice(i,1); removed=true; break;
           }
         }
       }
 
       // enemy hits
       for(const e of enemies){
-        if(removed||!e.alive) continue;
-        if(aabb(Math.min(b.x,b.px)-2,Math.min(b.y,b.py)-2, Math.abs(b.x-b.px)+4,Math.abs(b.y-b.py)+4, e.x-e.w/2, e.y-e.h/2, e.w, e.h)){
-          // coarse filter → fine as "point inside AABB" at end
+        if(removed || !e.alive) continue;
+        if(aabb(Math.min(b.x,b.px)-2,Math.min(b.y,b.py)-2, Math.abs(b.x-b.px)+4, Math.abs(b.y-b.py)+4, e.x-e.w/2, e.y-e.h/2, e.w, e.h)){
+          // end point overlap
           if(aabb(b.x-2,b.y-2,4,4, e.x-e.w/2, e.y-e.h/2, e.w, e.h)){
-            e.hp=Math.max(0, e.hp-12);
-            e.vx+=b.vx*0.02; e.vy+=b.vy*0.02;
-            spawnBlood(b.x,b.y, Math.atan2(b.vy,b.vx)); cam.shake+=0.08;
-            if(!e.enraged && e.hp<=e.maxHp*0.35){ e.enraged=true; e.fuse=1.9; }
-            if(e.hp===0 && e.alive){ e.alive=false; e.fade=0; decals.push({type:'corpse',x:e.x,y:e.y,age:0,life:20,rot:Math.random()*6}); }
+            e.hp = Math.max(0, e.hp - 12);
+            e.vx += b.vx*0.02; e.vy += b.vy*0.02;
+            spawnBlood(b.x,b.y, Math.atan2(b.vy,b.vx));
+            cam.shake = Math.min(cam.maxShake, cam.shake + 0.06);
+            if(!e.enraged && e.hp <= e.maxHp*0.35){ e.enraged=true; e.fuse=1.9; }
+            if(e.hp===0 && e.alive){ e.alive=false; e.fade=0; decals.push({type:'corpse',x:e.x,y:e.y,age:0,life:e.deadFadeTime,rot:Math.random()*6}); }
             bullets.splice(i,1); removed=true; break;
           }
         }
       }
 
-      // bounds
-      if(!removed && (b.x<world.bounds||b.x>world.W-world.bounds||b.y<world.bounds||b.y>world.H-world.bounds)){
-        // n is outward from border
+      // world bounds -> sparks
+      if(!removed && (b.x<world.bounds || b.x>world.W-world.bounds || b.y<world.bounds || b.y>world.H-world.bounds)){
         let nx=0, ny=0;
         if(b.x<world.bounds) nx=1; else if(b.x>world.W-world.bounds) nx=-1;
         if(b.y<world.bounds) ny=1; else if(b.y>world.H-world.bounds) ny=-1;
         spawnSparks(b.x,b.y, Math.atan2(b.vy,b.vx), nx, ny);
-        bullets.splice(i,1);
+        bullets.splice(i,1); removed=true;
       }
-      if(!removed && b.age>1.2){ bullets.splice(i,1); }
+
+      // lifespan cull
+      if(!removed && b.age > b.life){ bullets.splice(i,1); }
     }
 
-    // enemies brain / collisions / touch damage / enrage explode
+    // enemies AI / collisions / touch / enrage explode
+    let aliveCount = 0;
     for(const e of enemies){
-      if(!e.alive){ e.fade+=dt; continue; }
+      if(!e.alive){ e.fade += dt; continue; }
+      aliveCount++;
 
-      // state
+      // brain
       const dx=player.x-e.x, dy=player.y-e.y, dist=Math.hypot(dx,dy)||1, ux=dx/dist, uy=dy/dist;
-      if(dist<e.sight || cam.shake>0.35){ e.state='chase'; }
-
-      const baseSpeed = e.enraged ? 210 : 150;
+      if(dist<e.sight || cam.shake>0.35) e.state='chase';
+      const base = e.enraged ? 215 : 150;
       if(e.state==='wander'){
-        e.tw-=dt; if(e.tw<=0){ const a=Math.random()*Math.PI*2, m=90+Math.random()*120; e.wx=Math.cos(a)*m; e.wy=Math.sin(a)*m; e.tw=0.8+Math.random()*1.2; }
-        e.vx+=(e.wx-e.vx)*Math.min(1,dt*2); e.vy+=(e.wy-e.vy)*Math.min(1,dt*2);
-      } else {
-        e.vx+=(ux*baseSpeed-e.vx)*Math.min(1,dt*2.6);
-        e.vy+=(uy*baseSpeed-e.vy)*Math.min(1,dt*2.6);
-      }
+        e.tw -= dt; if(e.tw<=0){ const a=Math.random()*Math.PI*2, m=90+Math.random()*120; e.wx=Math.cos(a)*m; e.wy=Math.sin(a)*m; e.tw=0.8+Math.random()*1.2; }
+        e.vx += (e.wx-e.vx)*Math.min(1,dt*2); e.vy += (e.wy-e.vy)*Math.min(1,dt*2);
+      } else { e.vx += (ux*base - e.vx)*Math.min(1,dt*2.6); e.vy += (uy*base - e.vy)*Math.min(1,dt*2.6); }
       const ef=Math.exp(-11*dt); e.vx*=ef; e.vy*=ef; e.x+=e.vx*dt; e.y+=e.vy*dt;
 
-      // multi-pass obstacle resolution to avoid overlap
+      // strict obstacle resolution (two passes)
       for(let pass=0; pass<2; pass++){
         for(const o of world.obstacles){
           if(o.type==='rect'){
@@ -335,14 +359,12 @@
           }
         }
       }
-
-      // collide with player + touch damage
+      // vs player (touch dmg)
       const px=e.x-player.x, py=e.y-player.y, pr=player.r+Math.max(e.w,e.h)/2-6;
       if(px*px+py*py<pr*pr){
         const d=Math.hypot(px,py)||1, nx=px/d, ny=py/d, push=(pr-d);
         e.x += nx*push*0.6; e.y += ny*push*0.6;
         player.x -= nx*push*0.4; player.y -= ny*push*0.4;
-        // DOT damage
         player.hp = Math.max(0, player.hp - e.touchDps*dt);
       }
 
@@ -350,18 +372,25 @@
       if(e.enraged){
         e.fuse -= dt;
         if(e.fuse<=0){
-          // explode
-          const ex=e.x, ey=e.y; cam.shake+=0.6;
+          const ex=e.x, ey=e.y; cam.shake = Math.min(cam.maxShake, cam.shake + 0.6);
           spawnBlood(ex,ey,0);
-          // radial knockback/damage
-          const kx=player.x-ex, ky=player.y-ey, dd=Math.hypot(kx,ky)||1;
-          const fall = Math.max(0, 1 - dd/220); // within ~220px
+          const kx=player.x-ex, ky=player.y-ey, dd=Math.hypot(kx,ky)||1, fall=Math.max(0,1-dd/220);
           player.vx += (kx/dd)*240*fall; player.vy += (ky/dd)*240*fall;
-          player.hp = Math.max(0, player.hp - 36*fall); // critical but not lethal alone
-          e.alive=false; e.fade=0; decals.push({type:'corpse',x:ex,y:ey,age:0,life:20,rot:Math.random()*6});
+          player.hp = Math.max(0, player.hp - 36*fall);
+          e.alive=false; e.fade=0; decals.push({type:'corpse',x:ex,y:ey,age:0,life:1.2,rot:Math.random()*6});
+          aliveCount--;
         }
       }
     }
+
+    // clean faded decals quickly
+    for(let i=decals.length-1;i>=0;i--){ const d=decals[i]; d.age+=dt; if(d.age>d.life) decals.splice(i,1); }
+    for(let i=sparks.length-1;i>=0;i--){ const s=sparks[i]; s.age+=dt; s.vx*=0.98; s.vy=s.vy*0.98+600*dt*0.18; s.x+=s.vx*dt; s.y+=s.vy*dt; if(s.age>s.life) sparks.splice(i,1); }
+    for(let i=blood.length-1;i>=0;i--){ const b=blood[i]; b.age+=dt; b.vx*=0.98; b.vy=b.vy*0.98+600*dt*0.22; b.x+=b.vx*dt; b.y+=b.vy*dt; if(b.age>b.life) blood.splice(i,1); }
+
+    // maintain up to 10 alive
+    const aliveNow = enemies.filter(e=>e.alive).length;
+    if(aliveNow < 10){ spawnEnemiesTo(10); }
   }
 
   // ---------- Render ----------
@@ -381,12 +410,13 @@
   function drawObstacles(){
     ctx.lineWidth=1.5;
     for(const o of world.obstacles){
+      const col = OBS_COLS[o.cid%OBS_COLS.length];
       if(o.type==='rect'){
-        ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.strokeStyle='rgba(255,255,255,0.18)';
+        ctx.fillStyle=col.f; ctx.strokeStyle=col.s;
         ctx.fillRect(o.x-cam.x+cam.shx, o.y-cam.y+cam.shy, o.w, o.h);
         ctx.strokeRect(o.x-cam.x+cam.shx, o.y-cam.y+cam.shy, o.w, o.h);
       } else {
-        ctx.fillStyle='rgba(255,255,255,0.06)'; ctx.strokeStyle='rgba(255,255,255,0.18)';
+        ctx.fillStyle=col.f; ctx.strokeStyle=col.s;
         ctx.beginPath(); ctx.arc(o.x-cam.x+cam.shx, o.y-cam.y+cam.shy, o.r, 0, Math.PI*2); ctx.fill(); ctx.stroke();
       }
     }
@@ -405,10 +435,10 @@
     for(const e of enemies){
       if(!e.alive) continue;
       const x=e.x-cam.x+cam.shx, y=e.y-cam.y+cam.shy, r=10, w=e.w, h=e.h;
-      // body capsule
-      ctx.fillStyle=e.enraged ? PAL.enrageGlow : PAL.enemyBody; ctx.strokeStyle=PAL.enemyEdge; ctx.lineWidth=2;
-      if(e.enraged){ const p=(Math.sin(performance.now()/90)+1)/2; ctx.fillStyle=`rgba(255,98,98,${0.45+0.35*p})`; }
-      ctx.beginPath(); ctx.moveTo(x-w/2+r, y-h/2);
+      ctx.fillStyle = e.enraged ? `rgba(255,98,98,${0.5 + 0.35*((Math.sin(performance.now()/90)+1)/2)})` : PAL.enemyBody;
+      ctx.strokeStyle=PAL.enemyEdge; ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(x-w/2+r, y-h/2);
       ctx.arcTo(x+w/2, y-h/2, x+w/2, y+h/2, r);
       ctx.arcTo(x+w/2, y+h/2, x-w/2, y+h/2, r);
       ctx.arcTo(x-w/2, y+h/2, x-w/2, y-h/2, r);
@@ -416,8 +446,7 @@
       ctx.closePath(); ctx.fill(); ctx.stroke();
       // head
       ctx.beginPath(); ctx.arc(x, y-h*0.35, e.r, 0, Math.PI*2); ctx.fillStyle=PAL.enemyHead; ctx.fill();
-
-      // HP pips
+      // hp pips
       const pips=Math.ceil((e.hp/e.maxHp)*8), top=y-h/2-10;
       for(let i=0;i<8;i++){ ctx.fillStyle= i<pips ? '#ff6a6a' : 'rgba(255,255,255,0.15)'; ctx.fillRect(x-48+i*12, top, 8, 4); }
     }
@@ -439,7 +468,7 @@
       ctx.fillStyle='#fff5db'; ctx.beginPath(); ctx.arc(b.x-cam.x+cam.shx, b.y-cam.y+cam.shy, 2.1, 0, Math.PI*2); ctx.fill();
     }
   }
-  function drawSparks(){
+  function drawFX(){
     for(const s of sparks){
       const r=2*(1-s.age/s.life);
       ctx.fillStyle = s.age < s.life*0.5 ? PAL.sparkHot : PAL.sparkCool;
@@ -459,12 +488,12 @@
   }
 
   function render(){
-    drawGrid(); drawDecals(); drawObstacles(); drawEnemies(); drawSparks(); drawBullets(); drawPlayer(); drawHUD();
+    drawGrid(); drawDecals(); drawObstacles(); drawEnemies(); drawFX(); drawBullets(); drawPlayer(); drawHUD();
   }
 
   // ---------- Main ----------
   function frame(now){
-    const dt=Math.min(0.033, ((now-(frame.t||now))/1000)); frame.t=now;
+    const dt = Math.min(0.033, ((now-(frame.t||now))/1000)); frame.t=now;
     update(dt); render();
     requestAnimationFrame(frame);
   }
